@@ -1,18 +1,34 @@
-"""
-technocore_sdk.exceptions
-~~~~~~~~~~~~~~~~~~~~~~~~
+"""Exception hierarchy for the technocore SDK.
 
-Exception hierarchy for the technocore Python SDK.
+Every public method on :class:`technocore_sdk.client.TechnocoreClient` raises
+subclasses of :class:`TechnocoreError`. This module centralizes them so
+callers can catch a broad ``TechnocoreError`` and drill down by cause, or
+catch a specific subclass when they need finer-grained handling (for
+instance, retrying on :class:`TransientError` only).
 
-The SDK raises a small, well-defined family of exceptions so that callers can
-write precise ``except`` clauses instead of pattern-matching on strings. Every
-SDK-level error inherits from :class:`TechnocoreError`; transport-level
-failures (network, decoding, framing) are kept distinct from protocol-level
-semantic errors (bad request, not found, version mismatch, etc.) so that
-retry/backoff policies can be applied selectively.
+The hierarchy mirrors common HTTP failure modes plus a few SDK-local
+conditions:
 
-This module deliberately has no third-party dependencies; it is imported by
-``client.py`` and ``protocol.py`` and must stay side-effect free.
+    TechnocoreError
+    +-- TransportError          # connection / DNS / TLS failures
+    +-- ProtocolError           # malformed message, bad framing
+    +-- AuthenticationError     # DID signature rejected, unknown peer
+    +-- RateLimitError          # peer asked us to back off
+    +-- NotFoundError           # resource absent on remote
+    +-- ServerError             # 5xx-class failures
+    +-- TransientError          # safe to retry with backoff
+    +-- ConfigurationError      # bad local config, missing key, etc.
+
+Design notes
+------------
+* All errors carry an optional ``cause`` (the underlying exception, if any)
+  and a ``details`` dict for structured context (status code, headers,
+  payload excerpt). They stringify to a single line, which keeps log
+  pipelines happy.
+* Subclasses set sensible defaults for ``retryable`` so retry helpers
+  don't need a hand-maintained allow-list.
+* Nothing in this module imports anything from ``technocore_sdk.client``
+  to avoid a circular dependency.
 """
 
 from __future__ import annotations
@@ -21,186 +37,133 @@ from typing import Any, Mapping, Optional
 
 
 class TechnocoreError(Exception):
-    """Base class for every exception raised directly by the SDK.
+    """Base class for every error raised by the technocore SDK.
 
-    Catch this if you want to handle "anything the SDK did wrong" in one
-    place. For finer-grained control, catch one of the subclasses below.
+    Parameters
+    ----------
+    message:
+        Human-readable description. Kept on a single line.
+    cause:
+        The underlying exception, if this error wraps another.
+    details:
+        Free-form structured context (status code, peer DID, payload
+        excerpt, ...). Kept on the instance as ``self.details``.
+    retryable:
+        Hint for retry helpers. Defaults to ``False``; subclasses that
+        are safe to retry override it.
     """
 
-    def __init__(self, message: str, *, cause: Optional[BaseException] = None) -> None:
+    retryable: bool = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cause: Optional[BaseException] = None,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
-        self.__cause__ = cause
+        self.__cause__ = cause  # for `raise ... from ...` semantics
+        self.details: dict[str, Any] = dict(details) if details else {}
 
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return self.message
-
-
-# ---------------------------------------------------------------------------
-# Transport / connection layer
-# ---------------------------------------------------------------------------
+    def __str__(self) -> str:  # noqa: D401 - keep one-line rendering
+        if not self.details:
+            return self.message
+        # Flatten details into the message so log lines stay single-line.
+        parts = ", ".join(f"{k}={v!r}" for k, v in self.details.items())
+        return f"{self.message} ({parts})"
 
 
 class TransportError(TechnocoreError):
-    """Base class for failures in the HTTP transport itself.
+    """The HTTP transport itself failed before a response was received.
 
-    These are usually transient: connection reset, DNS failure, read timeout.
-    Callers may want to retry with backoff.
+    Examples: DNS resolution error, TCP reset, TLS handshake failure,
+    timeout. Always retryable — the peer never saw the request.
+    """
+
+    retryable = True
+
+
+class ProtocolError(TechnocoreError):
+    """The response was received but could not be parsed.
+
+    Raised for malformed JSON, truncated bodies, unknown envelope
+    fields, or a signed envelope whose signature did not verify against
+    the claimed sender DID. Not retryable — retrying won't make the
+    bytes valid.
     """
 
 
-class ConnectionFailed(TransportError):
-    """The SDK could not establish a TCP/TLS connection to the server."""
+class AuthenticationError(ProtocolError):
+    """The peer rejected our DID signature, or signed with an unknown DID.
 
-
-class Timeout(TransportError):
-    """A request or read exceeded the configured timeout."""
-
-
-class ProtocolViolation(TransportError):
-    """The server sent bytes that violated the HTTP/1.1 or framing rules.
-
-    This almost always indicates a bug in the server or a man-in-the-middle
-    that corrupted the stream. Retrying will not help.
+    Inherits from :class:`ProtocolError` because the bytes were
+    syntactically fine but semantically rejected. Not retryable; the
+    caller should refresh credentials or check their DID key.
     """
 
 
-class DecodeError(TransportError):
-    """A response body could not be decoded as the expected content type."""
+class RateLimitError(TechnocoreError):
+    """The peer asked us to slow down.
 
-
-# ---------------------------------------------------------------------------
-# Protocol / semantic layer
-# ---------------------------------------------------------------------------
-
-
-class APIError(TechnocoreError):
-    """The server returned a well-formed error response.
-
-    :attr status_code`` is the HTTP status code returned by the server.
-    :attr payload`` is the parsed JSON body (or ``None`` if absent).
+    The SDK surfaces ``Retry-After`` (if present) in
+    ``self.details['retry_after_seconds']`` so retry helpers can honor
+    it without re-parsing headers.
     """
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int,
-        payload: Optional[Mapping[str, Any]] = None,
-        cause: Optional[BaseException] = None,
-    ) -> None:
-        super().__init__(message, cause=cause)
-        self.status_code = int(status_code)
-        self.payload: Optional[Mapping[str, Any]] = payload
-
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return f"[{self.status_code}] {self.message}"
+    retryable = True
 
 
-class BadRequest(APIError):
-    """HTTP 400. The request was malformed or violated a protocol constraint."""
+class NotFoundError(TechnocoreError):
+    """The requested resource does not exist on the remote.
 
-
-class Unauthorized(APIError):
-    """HTTP 401. Missing or invalid credentials."""
-
-
-class Forbidden(APIError):
-    """HTTP 403. Credentials are valid but not permitted for this resource."""
-
-
-class NotFound(APIError):
-    """HTTP 404. The addressed room, agent, or resource does not exist."""
-
-
-class Conflict(APIError):
-    """HTTP 409. The request conflicts with current server state."""
-
-
-class RateLimited(APIError):
-    """HTTP 429. The caller has exceeded its rate budget.
-
-    :attr retry_after`` (float, optional) is the server's hint, in seconds.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int = 429,
-        payload: Optional[Mapping[str, Any]] = None,
-        cause: Optional[BaseException] = None,
-        retry_after: Optional[float] = None,
-    ) -> None:
-        super().__init__(message, status_code=status_code, payload=payload, cause=cause)
-        self.retry_after = retry_after
-
-
-class ServerError(APIError):
-    """HTTP 5xx. The server failed to fulfill a valid request."""
-
-
-# ---------------------------------------------------------------------------
-# Client-side validation
-# ---------------------------------------------------------------------------
-
-
-class ValidationError(TechnocoreError):
-    """The caller passed an invalid argument before any network I/O happened.
-
-    Catching this separately from :class:`TransportError` and
-    :class:`APIError` lets callers distinguish "my code is wrong" from
-    "the network/server is wrong".
+    Distinct from a generic 4xx so callers can branch on it cleanly
+    (e.g. return ``None`` instead of bubbling an error to the user).
     """
 
 
-# ---------------------------------------------------------------------------
-# Convenience mapping used by the client layer
-# ---------------------------------------------------------------------------
+class ServerError(TechnocoreError):
+    """A 5xx-class failure from the peer.
 
-#: HTTP status code -> exception class. The client layer uses this to
-#: turn a non-2xx response into the most specific exception it can.
-STATUS_TO_EXCEPTION: Mapping[int, type[APIError]] = {
-    400: BadRequest,
-    401: Unauthorized,
-    403: Forbidden,
-    404: NotFound,
-    409: Conflict,
-    429: RateLimited,
-}
-
-
-def exception_for_status(status: int) -> type[APIError]:
-    """Return the most specific :class:`APIError` subclass for an HTTP status.
-
-    Falls back to :class:`ServerError` for any unrecognised 5xx, or to the
-    base :class:`APIError` for any other 4xx code not in the table above.
+    Treated as retryable by default; subclasses or specific status
+    codes (501 Not Implemented) may override.
     """
-    if status in STATUS_TO_EXCEPTION:
-        return STATUS_TO_EXCEPTION[status]
-    if 500 <= status <= 599:
-        return ServerError
-    return APIError
+
+    retryable = True
+
+
+class TransientError(TechnocoreError):
+    """Generic safe-to-retry wrapper.
+
+    Use this when you catch a non-retryable error in a retry loop and
+    want to re-raise as something the outer loop knows how to handle
+    (for example, mapping a single ``ProtocolError`` on retry #2 into
+    a ``TransientError`` so the loop gives up gracefully).
+    """
+
+    retryable = True
+
+
+class ConfigurationError(TechnocoreError):
+    """The SDK is misconfigured locally.
+
+    Examples: missing Ed25519 private key, malformed DID document,
+    conflicting options on the client constructor. Never retryable —
+    the operator must fix the config first.
+    """
 
 
 __all__ = [
     "TechnocoreError",
     "TransportError",
-    "ConnectionFailed",
-    "Timeout",
-    "ProtocolViolation",
-    "DecodeError",
-    "APIError",
-    "BadRequest",
-    "Unauthorized",
-    "Forbidden",
-    "NotFound",
-    "Conflict",
-    "RateLimited",
+    "ProtocolError",
+    "AuthenticationError",
+    "RateLimitError",
+    "NotFoundError",
     "ServerError",
-    "ValidationError",
-    "STATUS_TO_EXCEPTION",
-    "exception_for_status",
+    "TransientError",
+    "ConfigurationError",
 ]
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
