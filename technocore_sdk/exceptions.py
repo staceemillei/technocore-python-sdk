@@ -1,34 +1,17 @@
 """Exception hierarchy for the technocore SDK.
 
-Every public method on :class:`technocore_sdk.client.TechnocoreClient` raises
-subclasses of :class:`TechnocoreError`. This module centralizes them so
-callers can catch a broad ``TechnocoreError`` and drill down by cause, or
-catch a specific subclass when they need finer-grained handling (for
-instance, retrying on :class:`TransientError` only).
+Centralising the exception types here lets callers do narrow ``except``
+blocks (``except ProtocolError``) without importing every internal module,
+and gives one obvious place to look when an SDK call misbehaves.
 
-The hierarchy mirrors common HTTP failure modes plus a few SDK-local
-conditions:
-
-    TechnocoreError
-    +-- TransportError          # connection / DNS / TLS failures
-    +-- ProtocolError           # malformed message, bad framing
-    +-- AuthenticationError     # DID signature rejected, unknown peer
-    +-- RateLimitError          # peer asked us to back off
-    +-- NotFoundError           # resource absent on remote
-    +-- ServerError             # 5xx-class failures
-    +-- TransientError          # safe to retry with backoff
-    +-- ConfigurationError      # bad local config, missing key, etc.
-
-Design notes
+Design goals
 ------------
-* All errors carry an optional ``cause`` (the underlying exception, if any)
-  and a ``details`` dict for structured context (status code, headers,
-  payload excerpt). They stringify to a single line, which keeps log
-  pipelines happy.
-* Subclasses set sensible defaults for ``retryable`` so retry helpers
-  don't need a hand-maintained allow-list.
-* Nothing in this module imports anything from ``technocore_sdk.client``
-  to avoid a circular dependency.
+* Inherit from a single root (``TechnocoreError``) so users can catch
+  *anything* the SDK raises with one statement.
+* Carry enough context (HTTP status, lane, raw body) to debug without
+  leaking secrets or unbounded payloads.
+* Stay import-safe: this module has zero non-stdlib dependencies so it can
+  be imported from anywhere in the SDK without risking circular imports.
 """
 
 from __future__ import annotations
@@ -37,133 +20,162 @@ from typing import Any, Mapping, Optional
 
 
 class TechnocoreError(Exception):
-    """Base class for every error raised by the technocore SDK.
+    """Root of the SDK exception tree.
 
-    Parameters
-    ----------
-    message:
-        Human-readable description. Kept on a single line.
-    cause:
-        The underlying exception, if this error wraps another.
-    details:
-        Free-form structured context (status code, peer DID, payload
-        excerpt, ...). Kept on the instance as ``self.details``.
-    retryable:
-        Hint for retry helpers. Defaults to ``False``; subclasses that
-        are safe to retry override it.
+    All exceptions raised by ``technocore_sdk`` are subclasses of this.
+    Catching ``TechnocoreError`` is the recommended "catch-all" pattern
+    for application code that wants to react to *any* SDK failure
+    (network issue, protocol violation, server error, ...) uniformly.
     """
 
-    retryable: bool = False
+    def __init__(self, message: str, *args: Any) -> None:
+        super().__init__(message, *args)
+        self.message: str = message
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.message
+
+
+# ---------------------------------------------------------------------------
+# Transport / configuration errors
+# ---------------------------------------------------------------------------
+
+class ConfigError(TechnocoreError):
+    """The client was constructed or called with invalid configuration.
+
+    Examples: a malformed DID, a base URL without scheme, a missing
+    required parameter that has no sensible default. These are always
+    programmer errors and should be fixed before deployment.
+    """
+
+
+class TransportError(TechnocoreError):
+    """A low-level transport problem prevented the request from completing.
+
+    Subclasses cover the cases we actually want to distinguish:
+    connection refused, DNS failure, timeout, TLS error. Anything not
+    covered by a subclass still lands here as a generic transport
+    failure.
+    """
 
     def __init__(
         self,
         message: str,
         *,
         cause: Optional[BaseException] = None,
-        details: Optional[Mapping[str, Any]] = None,
     ) -> None:
         super().__init__(message)
-        self.message = message
-        self.__cause__ = cause  # for `raise ... from ...` semantics
-        self.details: dict[str, Any] = dict(details) if details else {}
-
-    def __str__(self) -> str:  # noqa: D401 - keep one-line rendering
-        if not self.details:
-            return self.message
-        # Flatten details into the message so log lines stay single-line.
-        parts = ", ".join(f"{k}={v!r}" for k, v in self.details.items())
-        return f"{self.message} ({parts})"
+        self.__cause__ = cause
 
 
-class TransportError(TechnocoreError):
-    """The HTTP transport itself failed before a response was received.
+class ConnectionError(TransportError):  # noqa: A001 - intentional shadow
+    """The SDK could not establish a TCP/TLS connection to the server."""
 
-    Examples: DNS resolution error, TCP reset, TLS handshake failure,
-    timeout. Always retryable — the peer never saw the request.
-    """
 
-    retryable = True
+class TimeoutError(TransportError):  # noqa: A001 - intentional shadow
+    """The request did not complete within the configured timeout."""
 
+
+# ---------------------------------------------------------------------------
+# Protocol-level errors
+# ---------------------------------------------------------------------------
 
 class ProtocolError(TechnocoreError):
-    """The response was received but could not be parsed.
+    """The server's response did not conform to the technocore protocol.
 
-    Raised for malformed JSON, truncated bodies, unknown envelope
-    fields, or a signed envelope whose signature did not verify against
-    the claimed sender DID. Not retryable — retrying won't make the
-    bytes valid.
+    Raised when JSON is malformed, a required lane field is missing, or
+    the response otherwise cannot be interpreted. The optional
+    ``payload`` attribute carries the offending body (truncated if it
+    would be unreasonable to keep the whole thing in memory).
     """
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        lane: Optional[str] = None,
+        payload: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.lane: Optional[str] = lane
+        self.payload: Any = payload
 
-class AuthenticationError(ProtocolError):
-    """The peer rejected our DID signature, or signed with an unknown DID.
 
-    Inherits from :class:`ProtocolError` because the bytes were
-    syntactically fine but semantically rejected. Not retryable; the
-    caller should refresh credentials or check their DID key.
+class AuthError(ProtocolError):
+    """Authentication failed or credentials were rejected (HTTP 401/403).
+
+    Carries the underlying status code so callers can distinguish
+    "unauthenticated" (401, refresh and retry) from "forbidden"
+    (403, surface to user).
     """
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 401,
+        lane: Optional[str] = None,
+    ) -> None:
+        super().__init__(message, lane=lane)
+        self.status_code: int = status_code
 
-class RateLimitError(TechnocoreError):
-    """The peer asked us to slow down.
 
-    The SDK surfaces ``Retry-After`` (if present) in
-    ``self.details['retry_after_seconds']`` so retry helpers can honor
-    it without re-parsing headers.
+class RateLimitError(ProtocolError):
+    """The server is throttling this caller (HTTP 429).
+
+    The ``retry_after`` attribute, when set, reflects the seconds the
+    server asked us to wait before retrying. Clients are expected to
+    honour it rather than busy-loop.
     """
 
-    retryable = True
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: Optional[float] = None,
+        lane: Optional[str] = None,
+    ) -> None:
+        super().__init__(message, lane=lane)
+        self.retry_after: Optional[float] = retry_after
 
 
-class NotFoundError(TechnocoreError):
-    """The requested resource does not exist on the remote.
+class ServerError(ProtocolError):
+    """The server returned a 5xx response for an otherwise valid request.
 
-    Distinct from a generic 4xx so callers can branch on it cleanly
-    (e.g. return ``None`` instead of bubbling an error to the user).
+    These are usually transient; the SDK's retry policy decides whether
+    to re-issue the request automatically.
     """
 
-
-class ServerError(TechnocoreError):
-    """A 5xx-class failure from the peer.
-
-    Treated as retryable by default; subclasses or specific status
-    codes (501 Not Implemented) may override.
-    """
-
-    retryable = True
-
-
-class TransientError(TechnocoreError):
-    """Generic safe-to-retry wrapper.
-
-    Use this when you catch a non-retryable error in a retry loop and
-    want to re-raise as something the outer loop knows how to handle
-    (for example, mapping a single ``ProtocolError`` on retry #2 into
-    a ``TransientError`` so the loop gives up gracefully).
-    """
-
-    retryable = True
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 500,
+        body: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        super().__init__(message, payload=body)
+        self.status_code: int = status_code
 
 
-class ConfigurationError(TechnocoreError):
-    """The SDK is misconfigured locally.
+class NotFoundError(ProtocolError):
+    """The addressed room, agent, or resource does not exist (HTTP 404)."""
 
-    Examples: missing Ed25519 private key, malformed DID document,
-    conflicting options on the client constructor. Never retryable —
-    the operator must fix the config first.
-    """
 
+# ---------------------------------------------------------------------------
+# Convenience re-export
+# ---------------------------------------------------------------------------
 
 __all__ = [
     "TechnocoreError",
+    "ConfigError",
     "TransportError",
+    "ConnectionError",
+    "TimeoutError",
     "ProtocolError",
-    "AuthenticationError",
+    "AuthError",
     "RateLimitError",
-    "NotFoundError",
     "ServerError",
-    "TransientError",
-    "ConfigurationError",
+    "NotFoundError",
 ]
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
