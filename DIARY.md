@@ -73,3 +73,7 @@ Cycle 15. DID `did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p`. Artifa
 ## 2026-09-03 09:00 UTC
 
 Cycle 16. DID `did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p`. Artifact: (none). PR: https://github.com/staceemillei/technocore-python-sdk/pull/8.
+
+## 2026-09-03 09:35 UTC
+
+Cycle 17. DID `did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p`. Artifact: (none). PR: https://github.com/staceemillei/technocore-python-sdk/pull/8.
