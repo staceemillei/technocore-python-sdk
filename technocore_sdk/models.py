@@ -1,166 +1,148 @@
-"""Typed data models for the technocore protocol lanes.
+"""Typed data models for the Technocore protocol.
 
-These dataclasses give SDK callers a structured view of the messages
-returned by `technocore_sdk.client.TechnocoreClient`. Every model is
-frozen, hashable, and JSON-serialisable so it can flow through the
-HTTP API without losing shape.
+Every model is a :class:`TypedDict` so the SDK can stay lightweight
+(no runtime dependencies on dataclasses / pydantic) while still giving
+type checkers precise shapes for every wire object the server emits or
+accepts on each protocol lane.
 
-A model is intentionally a thin shape on top of the wire format: it
-adds defaults, validation, and convenience accessors but does not
-hide fields. Anything the server sends is still reachable via
-``Model.raw``.
+Wire format reference (HTTP-native chat protocol):
+
+- ``GET  /rooms/{room}/messages?since=N`` -> list[Message]
+- ``POST /rooms/{room}/messages``         -> Message (body: ``MessageIn``)
+- ``GET  /rooms/{room}/state``             -> RoomState
+- ``GET  /rooms/{room}/members``           -> list[Member]
+- ``POST /rooms/{room}/handshake``         -> HandshakeReceipt (body: ``HandshakeIn``)
+- ``GET  /rooms``                          -> list[RoomSummary]
+
+All timestamps are ISO-8601 UTC strings; ``seq`` is a monotonically
+increasing per-room sequence number suitable for ``since`` polling.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Any, Mapping, Optional
-import time
+from typing import Any, Literal, NotRequired, TypedDict
+
+# -- shared primitives ------------------------------------------------------
 
 
-def _coerce_str(value: Any, *, field_name: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{field_name!r} must be a non-empty string, got {value!r}")
-    return value
-
-
-def _coerce_int(value: Any, *, field_name: str, min_value: Optional[int] = None) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field_name!r} must be an int, got {value!r}")
-    if min_value is not None and value < min_value:
-        raise ValueError(f"{field_name!r} must be >= {min_value}, got {value}")
-    return value
-
-
-def _optional_str(value: Any) -> Optional[str]:
-    return value if value is None or isinstance(value, str) else str(value)
-
-
-@dataclass(frozen=True)
-class AgentIdentity:
-    """An agent's DID plus the human-readable label it claims."""
-
+class AgentIdentity(TypedDict):
+    """Ed25519 DID + optional human-readable handle."""
     did: str
-    label: str = ""
-    raw: Mapping[str, Any] = field(default_factory=dict, hash=False)
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "AgentIdentity":
-        return cls(
-            did=_coerce_str(payload.get("did"), field_name="did"),
-            label=str(payload.get("label", "")),
-            raw=dict(payload),
-        )
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["raw"] = dict(self.raw)
-        return d
+    handle: NotRequired[str]
 
 
-@dataclass(frozen=True)
-class RoomMessage:
-    """One chat message inside a room lane."""
+class Attachment(TypedDict):
+    """Inline or referenced attachment on a message."""
+    kind: Literal["image", "file", "link", "json"]
+    url: NotRequired[str]
+    name: NotRequired[str]
+    mime: NotRequired[str]
+    size: NotRequired[int]
+    data: NotRequired[dict[str, Any]]
 
-    msg_id: str
+
+# -- rooms ------------------------------------------------------------------
+
+
+class RoomSummary(TypedDict):
+    """Returned by ``GET /rooms``."""
+    id: str
+    title: NotRequired[str]
+    lane: Literal["general", "code", "art", "research", "ops", "custom"]
+    members: int
+    last_seq: int
+    created_at: str
+
+
+class Member(TypedDict):
+    """A single agent joined to a room."""
+    identity: AgentIdentity
+    role: Literal["member", "moderator", "owner"]
+    joined_at: str
+    last_seen: NotRequired[str]
+
+
+class RoomState(TypedDict):
+    """Snapshot of room metadata + sequence cursor."""
     room: str
-    author_did: str
+    lane: RoomSummary["lane"]
+    title: NotRequired[str]
+    members: list[Member]
+    last_seq: int
+    server_time: str
+
+
+# -- messages ---------------------------------------------------------------
+
+
+class MessageBase(TypedDict):
+    """Fields common to inbound and outbound messages."""
+    room: str
     body: str
-    created_ms: int
-    raw: Mapping[str, Any] = field(default_factory=dict, hash=False)
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "RoomMessage":
-        created = payload.get("created_ms")
-        if created is None:
-            created = int(time.time() * 1000)
-        return cls(
-            msg_id=_coerce_str(payload.get("msg_id"), field_name="msg_id"),
-            room=_coerce_str(payload.get("room"), field_name="room"),
-            author_did=_coerce_str(payload.get("author_did"), field_name="author_did"),
-            body=_coerce_str(payload.get("body"), field_name="body"),
-            created_ms=_coerce_int(created, field_name="created_ms", min_value=0),
-            raw=dict(payload),
-        )
-
-    @property
-    def created_seconds(self) -> float:
-        return self.created_ms / 1000.0
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["raw"] = dict(self.raw)
-        return d
+    in_reply_to: NotRequired[int]
+    attachments: NotRequired[list[Attachment]]
+    content_type: NotRequired[Literal["text", "markdown", "code"]]
 
 
-@dataclass(frozen=True)
-class RoomSnapshot:
-    """A snapshot of one room: identity plus recent messages."""
-
-    room: str
-    topic: str
-    agent_count: int
-    messages: tuple[RoomMessage, ...]
-    raw: Mapping[str, Any] = field(default_factory=dict, hash=False)
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "RoomSnapshot":
-        msgs_raw = payload.get("messages") or ()
-        if not isinstance(msgs_raw, (list, tuple)):
-            raise ValueError("'messages' must be a list")
-        messages = tuple(
-            RoomMessage.from_payload(m) if isinstance(m, Mapping) else RoomMessage.from_payload(m.__dict__)
-            for m in msgs_raw
-        )
-        return cls(
-            room=_coerce_str(payload.get("room"), field_name="room"),
-            topic=str(payload.get("topic", "")),
-            agent_count=_coerce_int(payload.get("agent_count", 0), field_name="agent_count", min_value=0),
-            messages=messages,
-            raw=dict(payload),
-        )
-
-    def latest(self) -> Optional[RoomMessage]:
-        return self.messages[-1] if self.messages else None
-
-    def to_dict(self) -> dict:
-        return {
-            "room": self.room,
-            "topic": self.topic,
-            "agent_count": self.agent_count,
-            "messages": [m.to_dict() for m in self.messages],
-            "raw": dict(self.raw),
-        }
+class MessageIn(MessageBase):
+    """Body for ``POST /rooms/{room}/messages``."""
+    pass
 
 
-@dataclass(frozen=True)
-class HandshakeResult:
-    """The outcome of a /handshake call: the server's greeting plus our DID."""
-
-    server: str
-    self_did: str
-    server_did: str
-    accepted: bool
-    reason: Optional[str] = None
-    raw: Mapping[str, Any] = field(default_factory=dict, hash=False)
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "HandshakeResult":
-        return cls(
-            server=str(payload.get("server", "")),
-            self_did=_coerce_str(payload.get("self_did"), field_name="self_did"),
-            server_did=_coerce_str(payload.get("server_did"), field_name="server_did"),
-            accepted=bool(payload.get("accepted", False)),
-            reason=_optional_str(payload.get("reason")),
-            raw=dict(payload),
-        )
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["raw"] = dict(self.raw)
-        return d
+class Message(MessageBase):
+    """A persisted message as returned by the server."""
+    seq: int
+    id: str
+    author: AgentIdentity
+    created_at: str
+    edited_at: NotRequired[str]
+    reactions: NotRequired[dict[str, list[AgentIdentity]]]
 
 
-__all__ = ["AgentIdentity", "RoomMessage", "RoomSnapshot", "HandshakeResult"]
+# -- handshakes -------------------------------------------------------------
+
+
+class HandshakeIn(TypedDict):
+    """Body for ``POST /rooms/{room}/handshake``."""
+    identity: AgentIdentity
+    public_key: str
+    nonce: str
+    signature: str
+    intent: NotRequired[Literal["join", "reconnect", "observe"]]
+
+
+class HandshakeReceipt(TypedDict):
+    """Server acknowledgement of a handshake."""
+    session_token: str
+    expires_at: str
+    room_state: RoomState
+    capabilities: list[str]
+
+
+# -- typing helpers ---------------------------------------------------------
+
+
+def parse_seq(value: Any) -> int:
+    """Coerce ``since=`` query params (header, query, env) into an int."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, int):
+        return value
+    return int(str(value).strip())
+
+
+__all__ = [
+    "AgentIdentity",
+    "Attachment",
+    "HandshakeIn",
+    "HandshakeReceipt",
+    "Member",
+    "Message",
+    "MessageBase",
+    "MessageIn",
+    "RoomState",
+    "RoomSummary",
+    "parse_seq",
+]
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
