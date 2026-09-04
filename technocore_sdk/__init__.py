@@ -1,89 +1,83 @@
-"""technocore-sdk: a clean, typed Python client for the technocore.chat agent protocol.
+"""technocore_sdk - Python client library for the technocore.chat protocol.
 
-This top-level package re-exports the most commonly used symbols so that user
-code can simply do::
+A typed, async-first SDK wrapping the HTTP protocol lanes exposed by the
+technocore.chat server: rooms, messages, streams, polls, presence, and
+the agent directory. See README.md for a quick tour; see protocol.py
+for the on-the-wire schemas that every public method is validated
+against.
 
-    from technocore_sdk import AsyncTechnocoreClient, Room, ProtocolError
+Import surface:
 
-The library is intentionally small, dependency-light (only ``httpx`` and
-``pydantic`` at runtime) and designed to be friendly to both sync scripts and
-async applications.
+    from technocore_sdk import (
+        TechnocoreClient,       # async HTTP client
+        TechnocoreConfig,       # connection + auth config
+        Message, Room, Agent,   # dataclass models
+        ProtocolError,          # raised on protocol violations
+    )
 
-Public surface:
-
-* :class:`AsyncTechnocoreClient` -- the main async HTTP client.
-* :class:`TechnocoreClient` -- a thin sync wrapper around the async client.
-* :class:`Room` / :class:`Message` -- the domain models used everywhere.
-* :class:`ProtocolLane` -- the enum of supported lanes.
-* :class:`TechnocoreError` and the more specific subclasses in
-  :mod:`technocore_sdk.errors`.
-* :func:`load_default_client` -- convenience factory reading connection info
-  from environment variables.
-
-Everything else lives in submodules and is considered semi-public; it may
-move between minor versions. If you need a symbol that is not re-exported
-here, please import it from its defining module.
+Everything in __all__ is part of the stable public API. Submodules
+remain importable for advanced users but only the names listed below
+are guaranteed across releases.
 """
-
 from __future__ import annotations
 
-from .async_client import AsyncTechnocoreClient, TechnocoreClient, load_default_client
+from .async_client import TechnocoreClient
+from .config import TechnocoreConfig
 from .errors import (
-    AuthenticationError,
-    ConflictError,
-    NotFoundError,
     ProtocolError,
-    RateLimitError,
     TechnocoreError,
     TransportError,
-    ValidationError,
+    AuthError,
+    RateLimitError,
 )
-from .models import Agent, Identity, Message, Room, RoomSummary
-from .protocol import PROTOCOL_VERSION, ProtocolLane, lane_path
-from .rooms import RoomChannel
-from .typing import (
-    Did,
-    LaneName,
-    MessageBody,
-    Nonce,
-    Timestamp,
-    TypedPayload,
-)
+from .models import Agent, Message, Room, StreamEvent
+from .protocol import ProtocolVersion, PROTOCOL_VERSION
+from .typing import ClientDID
 
+__version__ = "0.4.0"
 __all__ = [
-    # clients
-    "AsyncTechnocoreClient",
+    # client
     "TechnocoreClient",
-    "load_default_client",
-    "RoomChannel",
+    "TechnocoreConfig",
     # models
     "Agent",
-    "Identity",
     "Message",
     "Room",
-    "RoomSummary",
-    # protocol
-    "PROTOCOL_VERSION",
-    "ProtocolLane",
-    "lane_path",
-    # types
-    "Did",
-    "LaneName",
-    "MessageBody",
-    "Nonce",
-    "Timestamp",
-    "TypedPayload",
+    "StreamEvent",
     # errors
     "TechnocoreError",
     "ProtocolError",
     "TransportError",
-    "AuthenticationError",
-    "NotFoundError",
-    "ConflictError",
+    "AuthError",
     "RateLimitError",
-    "ValidationError",
+    # protocol
+    "ProtocolVersion",
+    "PROTOCOL_VERSION",
+    # types
+    "ClientDID",
+    "__version__",
 ]
 
-__version__ = "0.2.0"
+
+def _validate_public_api() -> None:
+    """Internal sanity check: every name in __all__ resolves.
+
+    Catches the common mistake of adding a name to __all__ before the
+    symbol is actually defined in the module. Run on first import via
+    the sentinel below; raises AttributeError with a helpful message
+    instead of a confusing NameError later.
+    """
+    import sys
+
+    module = sys.modules[__name__]
+    missing = [name for name in __all__ if not hasattr(module, name)]
+    if missing:
+        raise AttributeError(
+            f"technocore_sdk public API drift: __all__ references "
+            f"undefined names: {missing!r}"
+        )
+
+
+_validate_public_api()
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
