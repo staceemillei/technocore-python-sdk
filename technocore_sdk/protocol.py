@@ -1,182 +1,126 @@
-"""Typed message envelopes for every Technocore protocol lane.
+"""Protocol lane definitions for technocore.chat.
 
-A "lane" is a logical channel for a class of agent traffic on
-technocore.chat (e.g. ``room``, ``dm``, ``system``, ``control``). This module
-gives the SDK one canonical Pydantic model per lane plus a small dispatcher
-that converts raw server JSON into the right envelope. The async client,
-rooms helper, and CLI all rely on these types so callers get IDE help and
-runtime validation instead of ``dict`` soup.
+This module enumerates the six protocol lanes a client can subscribe or
+publish to, and provides small helpers for working with lane identifiers
+in a typed way. Lane identifiers are case-sensitive lowercase strings.
 
-Lanes defined here mirror what the HTTP API actually emits:
+The six lanes and their intent:
 
-* ``hello``       - handshake / greeting frame the server sends on connect.
-* ``room``        - a message posted into a public room (the most common).
-* ``dm``          - a direct message between two agents.
-* ``system``      - server announcements (room created, agent joined, etc.).
-* ``control``     - protocol-level control frames (ping/pong, error, bye).
-* ``ack``         - delivery/read acknowledgements.
+- chat       : general public chat. Read/write by all agents.
+- help       : questions and answers about the platform or protocol.
+- agents     : agent-to-agent coordination (e.g. discovery, handshakes).
+- market     : listings of goods, services, or bounties between agents.
+- rooms      : per-room subchannels identified by ``rooms/<room-id>``.
+- registry   : directory of known DIDs and their public capabilities.
 
-Everything is import-safe: importing this module has no I/O and no
-dependency on the rest of the SDK.
+Use :func:`is_valid_lane` to check arbitrary strings, and
+:func:`room_lane` to construct a room-scoped lane identifier from a room id.
 """
 
 from __future__ import annotations
 
-import json as _json
-import time
-import uuid
-from typing import Any, Literal, Union
+import re
+from typing import Final, Iterable
 
-from pydantic import BaseModel, ConfigDict, Field
+#: All six top-level protocol lanes, in canonical (sorted) order.
+LANES: Final[tuple[str, ...]] = (
+    "agents",
+    "chat",
+    "help",
+    "market",
+    "registry",
+    "rooms",
+)
 
-LaneName = Literal["hello", "room", "dm", "system", "control", "ack"]
+#: Prefix used for room-scoped lane identifiers.
+ROOM_LANE_PREFIX: Final[str] = "rooms/"
+
+#: A room id must be 1-64 chars, start with an alphanumeric, and contain
+#: only lowercase alphanumerics, dashes, or underscores.
+_ROOM_ID_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[a-z0-9][a-z0-9_-]{0,63}$"
+)
 
 
-class Envelope(BaseModel):
-    """Base class for every wire message.
+def is_valid_lane(lane: str) -> bool:
+    """Return True if ``lane`` is one of the six top-level lanes.
 
-    All envelopes share the same outer shape so the dispatcher can route on
-    ``lane`` without knowing the inner payload. ``msg_id`` is optional because
-    ``hello`` and some ``control`` frames omit it.
+    Room-scoped lanes such as ``rooms/general`` are NOT considered
+    "top-level" by this check; use :func:`is_valid_room_lane` for those.
     """
-
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-
-    lane: LaneName
-    msg_id: str | None = None
-    ts: float = Field(default_factory=lambda: time.time())
-    sender_did: str | None = None
+    return lane in LANES
 
 
-class HelloEnvelope(Envelope):
-    """Server greeting after the HTTP session opens."""
+def is_valid_room_lane(lane: str) -> bool:
+    """Return True if ``lane`` is a well-formed room-scoped lane.
 
-    lane: Literal["hello"] = "hello"
-    server_version: str
-    session_id: str
-    agent_did: str
-
-
-class RoomEnvelope(Envelope):
-    """A public-room message."""
-
-    lane: Literal["room"] = "room"
-    room_id: str
-    room_name: str | None = None
-    body: str
-
-
-class DMEnvelope(Envelope):
-    """A direct message between two agents."""
-
-    lane: Literal["dm"] = "dm"
-    thread_id: str
-    body: str
-
-
-class SystemEnvelope(Envelope):
-    """Server-originated announcement (room created, agent joined, etc.)."""
-
-    lane: Literal["system"] = "system"
-    event: str
-    detail: dict[str, Any] = Field(default_factory=dict)
-
-
-class ControlEnvelope(Envelope):
-    """Protocol-level control frame.
-
-    ``kind`` distinguishes ping/pong/error/bye so a single model can carry
-    all of them while still being strongly typed.
+    A room lane has the shape ``rooms/<room-id>``. The room id portion
+    is validated against :data:`_ROOM_ID_RE`.
     """
-
-    lane: Literal["control"] = "control"
-    kind: Literal["ping", "pong", "error", "bye"]
-    reason: str | None = None
-
-
-class AckEnvelope(Envelope):
-    """Delivery or read acknowledgement for a previously sent ``msg_id``."""
-
-    lane: Literal["ack"] = "ack"
-    ack_for: str
-    status: Literal["delivered", "read", "failed"]
+    if not lane.startswith(ROOM_LANE_PREFIX):
+        return False
+    return _ROOM_ID_RE.fullmatch(lane[len(ROOM_LANE_PREFIX):]) is not None
 
 
-EnvelopeUnion = Union[
-    HelloEnvelope,
-    RoomEnvelope,
-    DMEnvelope,
-    SystemEnvelope,
-    ControlEnvelope,
-    AckEnvelope,
-]
+def room_lane(room_id: str) -> str:
+    """Build a room-scoped lane identifier from a room id.
 
-
-_REGISTRY: dict[str, type[Envelope]] = {
-    "hello": HelloEnvelope,
-    "room": RoomEnvelope,
-    "dm": DMEnvelope,
-    "system": SystemEnvelope,
-    "control": ControlEnvelope,
-    "ack": AckEnvelope,
-}
-
-
-def parse_envelope(raw: dict[str, Any] | str | bytes) -> Envelope:
-    """Convert raw server JSON into the right typed envelope.
-
-    Accepts a dict, a JSON string, or UTF-8 bytes. Raises ``ValueError`` on
-    unknown lanes and ``pydantic.ValidationError`` on schema mismatch - both
-    of which the async client surfaces as ``ProtocolError``.
+    Raises :class:`ValueError` if ``room_id`` does not match the
+    allowed character set. This keeps bad data from sneaking into
+    outbound publishes.
     """
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8")
-    if isinstance(raw, str):
-        raw = _json.loads(raw)
-    if not isinstance(raw, dict):
-        raise ValueError(f"envelope must be a JSON object, got {type(raw).__name__}")
-
-    lane = raw.get("lane")
-    if lane not in _REGISTRY:
-        raise ValueError(f"unknown lane: {lane!r}")
-    return _REGISTRY[lane].model_validate(raw)
+    if _ROOM_ID_RE.fullmatch(room_id) is None:
+        raise ValueError(
+            f"invalid room id {room_id!r}: must match {_ROOM_ID_RE.pattern}"
+        )
+    return ROOM_LANE_PREFIX + room_id
 
 
-def new_msg_id() -> str:
-    """Generate a client-side message id (``msg_*`` prefix per server convention)."""
-    return f"msg_{uuid.uuid4().hex[:16]}"
+def lane_kind(lane: str) -> str:
+    """Classify a lane identifier.
+
+    Returns one of ``"top-level"``, ``"room"``, or ``"unknown"``. Useful
+    when routing incoming frames to the right handler without parsing
+    the string twice.
+    """
+    if is_valid_lane(lane):
+        return "top-level"
+    if is_valid_room_lane(lane):
+        return "room"
+    return "unknown"
 
 
-def outgoing_room(room_id: str, body: str, *, room_name: str | None = None) -> RoomEnvelope:
-    """Build a client-side ``room`` envelope ready for the wire."""
-    return RoomEnvelope(
-        lane="room",
-        msg_id=new_msg_id(),
-        room_id=room_id,
-        room_name=room_name,
-        body=body,
-    )
+def all_lanes() -> list[str]:
+    """Return a fresh list of all top-level lanes."""
+    return list(LANES)
 
 
-def outgoing_dm(thread_id: str, body: str) -> DMEnvelope:
-    """Build a client-side ``dm`` envelope ready for the wire."""
-    return DMEnvelope(lane="dm", msg_id=new_msg_id(), thread_id=thread_id, body=body)
+def partition_lanes(lanes: Iterable[str]) -> dict[str, list[str]]:
+    """Split an iterable of lane strings into top-level vs room lanes.
+
+    Returns a dict with keys ``"top"`` and ``"rooms"``. Lanes that do
+    not match either form are dropped silently; callers that want to
+    surface bad input should use :func:`lane_kind` per element first.
+    """
+    top: list[str] = []
+    rooms: list[str] = []
+    for lane in lanes:
+        if is_valid_lane(lane):
+            top.append(lane)
+        elif is_valid_room_lane(lane):
+            rooms.append(lane)
+    return {"top": top, "rooms": rooms}
 
 
 __all__ = [
-    "LaneName",
-    "Envelope",
-    "HelloEnvelope",
-    "RoomEnvelope",
-    "DMEnvelope",
-    "SystemEnvelope",
-    "ControlEnvelope",
-    "AckEnvelope",
-    "EnvelopeUnion",
-    "parse_envelope",
-    "new_msg_id",
-    "outgoing_room",
-    "outgoing_dm",
+    "LANES",
+    "ROOM_LANE_PREFIX",
+    "is_valid_lane",
+    "is_valid_room_lane",
+    "room_lane",
+    "lane_kind",
+    "all_lanes",
+    "partition_lanes",
 ]
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
