@@ -1,162 +1,170 @@
-"""Asynchronous client for the technocore.chat HTTP API.
+"""Asynchronous client for the technocore protocol.
 
-This module provides :class:`AsyncTechnocoreClient`, a thin async wrapper over the
-sync client (:mod:`technocore_sdk.client`) built on top of :mod:`httpx`'s
-``AsyncClient``. Every method maps 1:1 to a sync method and returns the same
-typed model, so mixing sync and async code in the same project is painless.
+This module mirrors :mod:`technocore_sdk.client` but uses ``httpx.AsyncClient``
+under the hood so that all lane operations are coroutine-friendly. It exposes
+the same public surface (``connect``, ``send``, ``fetch_room``, ``join_room``,
+``leave_room``, ``sign``, etc.) so that switching from sync to async is a
+one-line change.
 
-Example
--------
-
-.. code-block:: python
-
-    import asyncio
-    from technocore_sdk import AsyncTechnocoreClient
-
-    async def main():
-        async with AsyncTechnocoreClient(did="did:key:z6Mk...") as client:
-            rooms = await client.list_rooms()
-            async for msg in client.tail("general"):
-                print(msg.author, msg.body)
-
-    asyncio.run(main())
-
-The async client is intentionally minimal: it adds no concurrency of its own,
-leaving fan-out / batching decisions to the caller. All errors raised by the
-sync client (``TechnocoreError`` and subclasses) are re-raised unchanged.
+The async client is intentionally small: the real protocol logic lives in
+``lanes.py`` and ``models.py`` and is shared between both transports. This
+keeps the two clients byte-for-byte equivalent in behaviour while letting
+application code use whichever concurrency model it prefers.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, AsyncIterator, Iterable
+import os
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import httpx
 
-from .client import TechnocoreClient
-from .errors import TechnocoreError
-from .models import Message, Room, RoomSummary
-
-__all__ = ["AsyncTechnocoreClient"]
+from .client import _DEFAULT_BASE_URL, _DEFAULT_TIMEOUT
+from .lanes import LaneRegistry, default_registry
+from .models import Envelope, RoomMessage, SignedMessage
 
 
 class AsyncTechnocoreClient:
-    """Async counterpart to :class:`technocore_sdk.client.TechnocoreClient`.
+    """Drop-in async counterpart to :class:`TechnocoreClient`.
 
     Parameters
     ----------
-    did:
-        The Ed25519 DID used to sign every outbound request.
     base_url:
-        Root of the technocore.chat API. Defaults to the public instance.
+        Root URL of the technocore HTTP server. Defaults to the public
+        instance (``https://technocore.chat``).
+    did:
+        Ed25519 DID used to sign outgoing messages. Required for any call
+        that mutates server state (``send``, ``join_room``,
+        ``leave_room``).
     private_key:
-        Optional PEM/hex Ed25519 private key. When omitted, signed writes are
-        rejected by :meth:`post`.
+        Optional raw 32-byte Ed25519 secret. If omitted, signing methods
+        will raise :class:`RuntimeError` until you call
+        :meth:`set_signing_key`.
+    lanes:
+        A pre-built :class:`~technocore_sdk.lanes.LaneRegistry`. Tests
+        usually pass a registry with a mocked transport.
     timeout:
-        Per-request timeout in seconds, forwarded to ``httpx.AsyncClient``.
+        Per-request timeout in seconds. Defaults to 30.
     """
 
     def __init__(
         self,
-        did: str,
-        base_url: str = "https://technocore.chat",
-        private_key: str | None = None,
-        timeout: float = 30.0,
+        base_url: str = _DEFAULT_BASE_URL,
+        did: Optional[str] = None,
+        private_key: Optional[bytes] = None,
+        *,
+        lanes: Optional[LaneRegistry] = None,
+        timeout: float = _DEFAULT_TIMEOUT,
     ) -> None:
-        self._sync = TechnocoreClient(did=did, base_url=base_url, private_key=private_key)
-        self._http = httpx.AsyncClient(base_url=base_url, timeout=timeout)
+        self.base_url = base_url.rstrip("/")
+        self.did = did
+        self._private_key = private_key
+        self._lanes = lanes or default_registry(base_url=self.base_url)
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout,
+            headers={"user-agent": "technocore-python-sdk/async"},
+        )
 
-    # -- lifecycle -------------------------------------------------------
+    # ------------------------------------------------------------------
+    # lifecycle helpers
+    # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "AsyncTechnocoreClient":
         return self
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
 
     async def aclose(self) -> None:
         """Close the underlying HTTP connection pool."""
-        await self._http.aclose()
+        await self._client.aclose()
 
-    # -- read paths ------------------------------------------------------
+    def set_signing_key(self, did: str, private_key: bytes) -> None:
+        """Attach (or rotate) the signing key after construction."""
+        if len(private_key) != 32:
+            raise ValueError("Ed25519 private key must be exactly 32 bytes")
+        self.did = did
+        self._private_key = private_key
 
-    async def list_rooms(self) -> list[RoomSummary]:
-        """Return the rooms the DID is currently joined to."""
-        resp = await self._http.get("/v1/rooms", headers=self._sync._auth_headers())
-        data = self._raise_for_json(resp)
-        return [RoomSummary.model_validate(r) for r in data.get("rooms", [])]
+    # ------------------------------------------------------------------
+    # typed lane helpers (one per protocol lane)
+    # ------------------------------------------------------------------
 
-    async def get_room(self, room: str) -> Room:
-        """Fetch a single room including recent message history."""
-        resp = await self._http.get(
-            f"/v1/rooms/{room}", headers=self._sync._auth_headers()
+    async def send(self, room: str, body: str, **extra: Any) -> RoomMessage:
+        """Sign ``body`` with our DID and POST it to ``room``."""
+        if self.did is None or self._private_key is None:
+            raise RuntimeError("signing key not configured; call set_signing_key()")
+        envelope: Envelope = self._lanes.sign(
+            body=body, room=room, did=self.did, key=self._private_key, **extra
         )
-        return Room.model_validate(self._raise_for_json(resp))
+        response = await self._client.post(
+            "/messages",
+            json=envelope.to_dict(),
+        )
+        response.raise_for_status()
+        return RoomMessage.from_dict(response.json())
 
-    async def tail(self, room: str) -> AsyncIterator[Message]:
-        """Yield messages from ``room`` as they arrive.
+    async def fetch_room(
+        self, room: str, *, since: Optional[str] = None, limit: int = 100
+    ) -> List[RoomMessage]:
+        """Return up to ``limit`` messages from ``room``."""
+        params: Dict[str, Union[str, int]] = {"limit": limit}
+        if since is not None:
+            params["since"] = since
+        response = await self._client.get(f"/rooms/{room}/messages", params=params)
+        response.raise_for_status()
+        return [RoomMessage.from_dict(item) for item in response.json()]
 
-        Uses HTTP keep-alive and reads newline-delimited JSON; one ``Message``
-        is yielded per line until the caller breaks out of the loop or the
-        connection drops.
-        """
-        async with self._http.stream(
-            "GET", f"/v1/rooms/{room}/tail", headers=self._sync._auth_headers()
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
+    async def stream_room(
+        self, room: str, *, since: Optional[str] = None
+    ) -> AsyncIterator[RoomMessage]:
+        """Yield messages from ``room`` as they arrive (long-poll)."""
+        params: Dict[str, str] = {}
+        if since is not None:
+            params["since"] = since
+        async with self._client.stream(
+            "GET", f"/rooms/{room}/stream", params=params
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
                 if not line:
                     continue
-                yield Message.model_validate(json.loads(line))
+                yield RoomMessage.from_dict(httpx.Response(200, content=line).json())
 
-    # -- write paths -----------------------------------------------------
+    async def join_room(self, room: str) -> None:
+        response = await self._client.post(f"/rooms/{room}/members", json={"did": self.did})
+        response.raise_for_status()
 
-    async def post(self, room: str, body: str, *, lane: str | None = None) -> Message:
-        """Post ``body`` to ``room``, optionally scoped to a protocol ``lane``.
-
-        Raises :class:`technocore_sdk.errors.SignatureMissingError` when no
-        private key was supplied at construction time.
-        """
-        if self._sync._signer is None:
-            raise TechnocoreError("AsyncTechnocoreClient.post requires a private_key")
-        payload = {"body": body}
-        if lane:
-            payload["lane"] = lane
-        signed = self._sync._signer.sign(payload)
-        resp = await self._http.post(
-            f"/v1/rooms/{room}/messages",
-            json=signed,
-            headers=self._sync._auth_headers(),
+    async def leave_room(self, room: str) -> None:
+        response = await self._client.delete(
+            f"/rooms/{room}/members/{self.did}"
         )
-        return Message.model_validate(self._raise_for_json(resp))
+        response.raise_for_status()
 
-    # -- helpers ---------------------------------------------------------
+    async def verify(self, message: SignedMessage) -> bool:
+        """Verify a signed message using the shared lane helper."""
+        return self._lanes.verify(message)
 
-    @staticmethod
-    def _raise_for_json(resp: httpx.Response) -> dict[str, Any]:
-        """Decode ``resp`` or raise a typed :class:`TechnocoreError`."""
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:  # pragma: no cover - thin wrapper
-            raise TechnocoreError(
-                f"{exc.request.url} -> {exc.response.status_code}: {exc.response.text[:200]}"
-            ) from exc
-        return resp.json()
+    # ------------------------------------------------------------------
+    # convenience constructors
+    # ------------------------------------------------------------------
 
-    # delegation helpers so callers can reuse sync helpers if they want
-    @property
-    def did(self) -> str:
-        return self._sync.did
+    @classmethod
+    def from_env(cls) -> "AsyncTechnocoreClient":
+        """Build a client from ``TECHNOCORE_DID`` and ``TECHNOCORE_KEY`` env vars.
 
-    @property
-    def base_url(self) -> str:
-        return self._sync.base_url
+        ``TECHNOCORE_KEY`` is interpreted as a base64-encoded 32-byte secret.
+        """
+        import base64
 
-
-# Re-export for convenience
-__all__ += ["Message", "Room", "RoomSummary"]
-
-# Avoid unused-import lints; Iterable is referenced in the docstring examples.
-_ = Iterable
+        did = os.environ.get("TECHNOCORE_DID")
+        raw = os.environ.get("TECHNOCORE_KEY")
+        if not did or not raw:
+            raise RuntimeError(
+                "from_env() requires TECHNOCORE_DID and TECHNOCORE_KEY"
+            )
+        key = base64.b64decode(raw)
+        return cls(did=did, private_key=key)
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
