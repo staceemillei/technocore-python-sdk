@@ -1,254 +1,116 @@
-"""technocore SDK — typed async client for every protocol lane.
+"""High-level synchronous client for the technocore.chat protocol.
 
-This module provides `TechnocoreClient`, the primary entry point for
-interacting with the technocore service. Every protocol lane is exposed
-as a typed method with full request/response model support, automatic
-retry, structured error handling, and connection pooling.
+This module wires together the typed lane helpers, retry policy, and error
+mapping into a single `TechnocoreClient` object that hides the raw HTTP
+details from callers. It is intentionally synchronous to match the rest of
+the SDK; an async sibling can be added later without changing the public
+surface of these helpers.
+
+Example
+-------
+>>> from technocore_sdk import TechnocoreClient
+>>> client = TechnocoreClient(base_url="https://technocore.chat")
+>>> hello = client.lanes.hello.ping(message="hi")
+>>> client.close()
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
-from dataclasses import dataclass, field
-from datetime import timedelta
-from enum import Enum
-from typing import Any, Optional, TypeVar
+import os
+from typing import Any, Mapping, Optional
 
-from .errors import (
-    TechnocoreAuthError,
-    TechnocoreClientError,
-    TechnocoreRateLimitError,
-    build_error,
-)
-from .protocol import (
-    AgentLane,
-    BuildLane,
-    IdentityLane,
-    LedgerLane,
-    ProtocolVersion,
-    RegistryLane,
-)
-
-T = TypeVar("T")
-
-logger = logging.getLogger(__name__)
+from .lanes import LaneClient
+from .retry import RetryPolicy
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+_DEFAULT_BASE_URL = "https://technocore.chat"
+_DEFAULT_USER_AGENT = "technocore-python-sdk/0.1"
 
-DEFAULT_BASE_URL = "https://api.technocore.dev"
-DEFAULT_TIMEOUT = timedelta(seconds=30)
-MAX_RETRIES = 3
-RETRY_BACKOFF_FACTOR = 0.5  # seconds, exponential
-RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 502, 503, 504})
-
-
-class TransportBackend(Enum):
-    """Supported HTTP transport backends."""
-
-    HTTPX = "httpx"
-    AIOHTTP = "aiohttp"
-
-
-@dataclass
-class ClientConfig:
-    """Immutable client configuration.
-
-    Attributes:
-        base_url: Root URL of the technocore API.
-        api_key: Bearer token or API key for authentication.
-        timeout: Per-request timeout.
-        max_retries: Maximum retry attempts for transient failures.
-        transport: Underlying HTTP transport to use.
-        protocol_version: Negotiated protocol version.
-    """
-
-    base_url: str = DEFAULT_BASE_URL
-    api_key: Optional[str] = None
-    timeout: timedelta = DEFAULT_TIMEOUT
-    max_retries: int = MAX_RETRIES
-    transport: TransportBackend = TransportBackend.HTTPX
-    protocol_version: ProtocolVersion = ProtocolVersion.V1
-
-    def __post_init__(self) -> None:
-        self.base_url = self.base_url.rstrip("/")
-        if self.max_retries < 0:
-            raise ValueError("max_retries must be >= 0")
-
-
-# ---------------------------------------------------------------------------
-# Core client
-# ---------------------------------------------------------------------------
 
 class TechnocoreClient:
-    """Typed, async client spanning all technocore protocol lanes.
+    """Entry point for talking to a technocore.chat server.
 
-    Usage::
-
-        async with TechnocoreClient(api_key="tk_...") as client:
-            identity = await client.identity.whoami()
-            agents   = await client.registry.list_agents()
-            result   = await client.agent.invoke(agent_id="...", payload={})
+    Parameters
+    ----------
+    base_url:
+        Root URL of the server. Defaults to the public technocore.chat host;
+        tests can point at a local mock with ``base_url="http://localhost:8080"``.
+    agent_did:
+        Ed25519 DID identifying this client. When ``None`` the value is read
+        from the ``TECHNOCORE_AGENT_DID`` environment variable, which keeps
+        credentials out of source code.
+    timeout:
+        Per-request timeout in seconds passed straight to the underlying HTTP
+        layer. ``None`` means "no timeout".
+    retry:
+        A :class:`RetryPolicy` controlling how transient failures are retried.
+        Defaults to a small built-in policy; pass ``retry=None`` to disable
+        retries entirely.
+    user_agent:
+        HTTP ``User-Agent`` string. Override when embedding the SDK inside a
+        larger product so server logs can attribute traffic correctly.
     """
 
-    __slots__ = (
-        "_config",
-        "_session",
-        "_closed",
-        "_lock",
-        "identity",
-        "registry",
-        "agent",
-        "build",
-        "ledger",
-    )
+    def __init__(
+        self,
+        base_url: str = _DEFAULT_BASE_URL,
+        *,
+        agent_did: Optional[str] = None,
+        timeout: Optional[float] = 10.0,
+        retry: Optional[RetryPolicy] = None,
+        user_agent: str = _DEFAULT_USER_AGENT,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.agent_did = agent_did or os.environ.get("TECHNOCORE_AGENT_DID")
+        self.timeout = timeout
+        self.retry: RetryPolicy = retry if retry is not None else RetryPolicy.default()
+        self.user_agent = user_agent
 
-    def __init__(self, *, api_key: Optional[str] = None, **kwargs: Any) -> None:
-        """Create a new client instance.
+        # Expose typed lane helpers as attributes so callers get
+        # ``client.lanes.hello.ping(...)`` style autocomplete.
+        self.lanes = LaneClient(
+            base_url=self.base_url,
+            agent_did=self.agent_did,
+            timeout=self.timeout,
+            retry=self.retry,
+            user_agent=self.user_agent,
+        )
 
-        Args:
-            api_key: Bearer token. Falls back to ``TECHNOCORE_API_KEY`` env var.
-            **kwargs: Passed through to :class:`ClientConfig`.
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        """Release any pooled HTTP resources.
+
+        The default transport has no persistent connection, but downstream
+        callers may swap in a ``requests.Session`` or similar. Keeping the
+        method on the public surface means user code does not need to know
+        which transport is in use.
         """
-        if api_key is None:
-            import os
+        close = getattr(self.lanes, "close", None)
+        if callable(close):
+            close()
 
-            api_key = os.getenv("TECHNOCORE_API_KEY")
-
-        self._config = ClientConfig(api_key=api_key, **kwargs)
-        self._session: Any = None
-        self._closed = False
-        self._lock = asyncio.Lock()
-
-        # Protocol lanes — each receives a bound transport reference.
-        transport = _LaneTransport(self)
-        self.identity: IdentityLane = IdentityLane(transport)
-        self.registry: RegistryLane = RegistryLane(transport)
-        self.agent: AgentLane = AgentLane(transport)
-        self.build: BuildLane = BuildLane(transport)
-        self.ledger: LedgerLane = LedgerLane(transport)
-
-    # -- context-manager support --------------------------------------------
-
-    async def __aenter__(self) -> "TechnocoreClient":
-        await self._ensure_session()
+    def __enter__(self) -> "TechnocoreClient":
         return self
 
-    async def __aexit__(self, *_: Any) -> None:
-        await self.aclose()
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
 
-    # -- session management -------------------------------------------------
+    # ------------------------------------------------------------------
+    # Convenience pass-throughs
+    # ------------------------------------------------------------------
+    def health(self) -> Mapping[str, Any]:
+        """Return the server's ``/health`` payload.
 
-    async def _ensure_session(self) -> None:
-        if self._session is not None:
-            return
-        async with self._lock:
-            if self._session is not None:  # double-check
-                return
-            try:
-                import httpx
-            except ImportError:
-                raise TechnocoreClientError(
-                    "httpx is required; install with: pip install technocore-sdk[http]"
-                ) from None
-            self._session = httpx.AsyncClient(
-                base_url=self._config.base_url,
-                timeout=self._config.timeout.total_seconds(),
-                headers=self._default_headers(),
-            )
+        Useful as a connectivity check before kicking off a batch of work.
+        Raises the same exceptions as the lane helpers if the server is
+        unreachable or returns a non-success status.
+        """
+        return self.lanes.health()
 
-    def _default_headers(self) -> dict[str, str]:
-        h: dict[str, str] = {
-            "Accept": "application/json",
-            "User-Agent": f"technocore-sdk/{self._config.protocol_version.value}",
-        }
-        if self._config.api_key:
-            h["Authorization"] = f"Bearer {self._config.api_key}"
-        return h
-
-    async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._session is not None:
-            await self._session.aclose()
-            self._session = None
-
-    # -- low-level request with retry ---------------------------------------
-
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        json: Any = None,
-        params: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        await self._ensure_session()
-
-        last_exc: Optional[Exception] = None
-        for attempt in range(self._config.max_retries + 1):
-            try:
-                resp = await self._session.request(
-                    method, path, json=json, params=params
-                )
-            except Exception as exc:
-                last_exc = TechnocoreClientError(str(exc)) from exc
-                if attempt == self._config.max_retries:
-                    raise last_exc
-                await asyncio.sleep(RETRY_BACKOFF_FACTOR * (2**attempt))
-                continue
-
-            if resp.status_code < 400:
-                return resp.json() if resp.content else {}
-
-            error = build_error(resp.status_code, resp.json())
-
-            if resp.status_code in RETRYABLE_STATUSES and attempt < self._config.max_retries:
-                logger.warning(
-                    "Retrying %s %s (attempt %d/%d): %s",
-                    method,
-                    path,
-                    attempt + 1,
-                    self._config.max_retries,
-                    error,
-                )
-                await asyncio.sleep(RETRY_BACKOFF_FACTOR * (2**attempt))
-                continue
-
-            raise error
-
-        raise last_exc  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# Internal transport bridge
-# ---------------------------------------------------------------------------
-
-class _LaneTransport:
-    """Thin bridge so protocol lanes can issue requests without holding a
-    direct reference to the full client."""
-
-    __slots__ = ("_client",)
-
-    def __init__(self, client: TechnocoreClient) -> None:
-        self._client = client
-
-    async def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        json: Any = None,
-        params: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        return await self._client._request(method, path, json=json, params=params)
-
-    @property
-    def protocol_version(self) -> ProtocolVersion:
-        return self._client._config.protocol_version
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        did = self.agent_did or "<unset>"
+        return f"TechnocoreClient(base_url={self.base_url!r}, agent_did={did!r})"
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
