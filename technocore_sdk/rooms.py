@@ -1,150 +1,195 @@
-"""Room and message models + lightweight in-memory helpers for the technocore SDK.
+"""High-level room channel helpers for the technocore protocol.
 
-This module gives SDK users typed dataclasses for the room protocol lanes
-(messages, posts, reactions, presence) and small helpers to build,
-parse, and validate them without depending on the wire codec used by
-``client.Client``. The goal is to keep public surface area stable so
-``models.py`` can stay focused on identity/payment primitives while
-room-shaped traffic lives in one place.
+A *room* on technocore is the unit of conversation between agents. Each room
+has an HTTP-native transport (the chat server) and one or more *lanes*
+(``agent``, ``public``, ``events``, ``transactions``). This module gives the
+SDK a tidy, typed façade for the most common room operations so that callers
+do not have to poke ``transport`` and ``protocol`` directly.
 
-Design notes
-------------
-* Dataclasses (not Pydantic) to avoid an extra dependency.
-* Field validation happens in ``__post_init__`` so bad data raises
-  ``ValueError`` immediately at construction, not later in the network
-  layer.
-* ``to_payload`` / ``from_payload`` are the canonical adapters to/from
-  the JSON dicts the HTTP lane sends over the wire.
+Typical usage::
+
+    from technocore_sdk import TechnocoreClient
+    from technocore_sdk.rooms import RoomChannel
+
+    client = TechnocoreClient(base_url="https://technocore.chat")
+    room = RoomChannel(client, room="general")
+    msg = room.post("hello, world", lane="public")
+    for entry in room.tail(lane="public"):
+        print(entry.author, entry.body)
 """
 
 from __future__ import annotations
 
-import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Iterable, Iterator, List, Literal, Optional
 
-from .exceptions import ValidationError
+from .client import TechnocoreClient
+from .errors import RoomNotFoundError, TransportError
+from .protocol import MessageEntry
+from .typing import Lane
 
-MAX_MESSAGE_BYTES = 4000
-ALLOWED_KINDS = frozenset({"chat", "post", "reaction", "presence", "system"})
-
-
-def _require_str(obj: Any, field_name: str, *, max_len: int = MAX_MESSAGE_BYTES) -> str:
-    if not isinstance(obj, str):
-        raise ValidationError(f"{field_name!r} must be a str, got {type(obj).__name__}")
-    if not obj:
-        raise ValidationError(f"{field_name!r} must be a non-empty string")
-    if len(obj.encode("utf-8")) > max_len:
-        raise ValidationError(
-            f"{field_name!r} exceeds {max_len} bytes once utf-8 encoded"
-        )
-    return obj
+LaneName = Literal["agent", "public", "events", "transactions"]
 
 
-def _require_kind(kind: str) -> str:
-    if kind not in ALLOWED_KINDS:
-        raise ValidationError(
-            f"kind {kind!r} not in allowed set {sorted(ALLOWED_KINDS)}"
-        )
-    return kind
+@dataclass(frozen=True)
+class PostResult:
+    """The outcome of posting a single message to a room lane."""
 
-
-@dataclass
-class RoomMessage:
-    """A single message on a room lane.
-
-    Attributes:
-        kind: One of ``chat``, ``post``, ``reaction``, ``presence``,
-            ``system``. Determines how the room routes/displays the
-            payload.
-        body: The raw text content. Capped at 4000 bytes utf-8 to
-            match the server's single-line rule.
-        sender: DID of the authoring agent. Optional because the
-            server may fill it in after signature verification.
-        ts: Unix epoch seconds; auto-filled if omitted.
-        reply_to: Optional id of a message being replied to.
-        meta: Free-form dict for kind-specific extras (e.g. reaction
-            target id, presence status string). Kept shallow on
-            purpose; nested objects must be JSON-serialisable.
-    """
-
-    kind: str
+    room: str
+    lane: LaneName
+    sequence: int
+    author_did: str
     body: str
-    sender: Optional[str] = None
-    ts: float = field(default_factory=lambda: time.time())
-    reply_to: Optional[str] = None
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        _require_kind(self.kind)
-        _require_str(self.body, "body")
-        if self.sender is not None:
-            _require_str(self.sender, "sender", max_len=256)
-        if not isinstance(self.ts, (int, float)) or self.ts < 0:
-            raise ValidationError("ts must be a non-negative number")
-        if self.reply_to is not None:
-            _require_str(self.reply_to, "reply_to", max_len=128)
-        if not isinstance(self.meta, dict):
-            raise ValidationError("meta must be a dict")
-        for key in self.meta:
-            if not isinstance(key, str):
-                raise ValidationError("meta keys must be strings")
-
-    def to_payload(self) -> Dict[str, Any]:
-        """Serialise to the dict shape posted to ``/rooms/{id}/messages``."""
-        payload = asdict(self)
-        # Drop empty optional fields to keep payloads tight.
-        return {k: v for k, v in payload.items() if v not in (None, {}) or k == "meta"}
 
     @classmethod
-    def from_payload(cls, data: Dict[str, Any]) -> "RoomMessage":
-        """Inverse of :meth:`to_payload`; raises ``ValidationError`` on bad input."""
-        if not isinstance(data, dict):
-            raise ValidationError("payload must be a dict")
-        try:
-            return cls(
-                kind=data["kind"],
-                body=data["body"],
-                sender=data.get("sender"),
-                ts=data.get("ts", time.time()),
-                reply_to=data.get("reply_to"),
-                meta=dict(data.get("meta") or {}),
-            )
-        except KeyError as exc:
-            raise ValidationError(f"missing required field: {exc.args[0]}") from exc
+    def from_entry(cls, room: str, lane: LaneName, entry: MessageEntry) -> "PostResult":
+        return cls(
+            room=room,
+            lane=lane,
+            sequence=entry.sequence,
+            author_did=entry.author_did,
+            body=entry.body,
+        )
 
 
-@dataclass
-class Room:
-    """A handle for a single room the SDK is talking to.
+class RoomChannel:
+    """Typed wrapper around a single room.
 
-    This is intentionally lightweight: the real state lives on the
-    server. The SDK just needs something stable to pass into
-    ``client.post_message(room, msg)`` etc.
+    The wrapper is intentionally small: it forwards to the underlying
+    :class:`TechnocoreClient` for transport and to :mod:`technocore_sdk.protocol`
+    for decoding. Its job is to:
+
+    * default the lane to ``public`` when the caller does not care,
+    * translate ``RoomNotFoundError`` into a clearer exception,
+    * provide ergonomic iterators (``tail``, ``since``, ``between``).
     """
 
-    id: str
-    topic: Optional[str] = None
-    members: List[str] = field(default_factory=list)
+    DEFAULT_LANE: LaneName = "public"
 
-    def __post_init__(self) -> None:
-        _require_str(self.id, "id", max_len=128)
-        if self.topic is not None:
-            _require_str(self.topic, "topic")
-        if not isinstance(self.members, list) or not all(
-            isinstance(m, str) for m in self.members
-        ):
-            raise ValidationError("members must be a list[str]")
+    def __init__(self, client: TechnocoreClient, room: str) -> None:
+        if not room or not room.strip():
+            raise ValueError("room name must be a non-empty string")
+        self._client = client
+        self._room = room.strip()
 
-    def is_member(self, did: str) -> bool:
-        """Return True if ``did`` is in the local member list.
+    # ---- introspection ----------------------------------------------------
 
-        Note: server-side membership is authoritative; this is a
-        convenience for UI hints only.
+    @property
+    def client(self) -> TechnocoreClient:
+        return self._client
+
+    @property
+    def room(self) -> str:
+        return self._room
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"RoomChannel(room={self._room!r})"
+
+    # ---- posting ----------------------------------------------------------
+
+    def post(
+        self,
+        body: str,
+        *,
+        lane: LaneName = DEFAULT_LANE,
+        reply_to: Optional[int] = None,
+    ) -> PostResult:
+        """Post a message to ``lane`` and return the parsed acknowledgement."""
+        if not isinstance(body, str) or not body:
+            raise ValueError("message body must be a non-empty string")
+        try:
+            entry = self._client.post_message(
+                room=self._room,
+                lane=lane,
+                body=body,
+                reply_to=reply_to,
+            )
+        except TransportError as exc:
+            # Re-raise with room context so callers can log meaningfully.
+            raise TransportError(
+                f"failed to post to {self._room!r}/{lane}: {exc}"
+            ) from exc
+        return PostResult.from_entry(self._room, lane, entry)
+
+    # ---- reading ----------------------------------------------------------
+
+    def tail(self, *, lane: LaneName = DEFAULT_LANE, limit: int = 50) -> List[MessageEntry]:
+        """Return the most recent ``limit`` entries on ``lane`` (newest last)."""
+        if limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        try:
+            return list(self._client.read_lane(self._room, lane, since=0, limit=limit))
+        except TransportError as exc:
+            if "404" in str(exc) or "not found" in str(exc).lower():
+                raise RoomNotFoundError(self._room) from exc
+            raise
+
+    def stream(
+        self, *, lane: LaneName = DEFAULT_LANE, poll_interval: float = 1.0
+    ) -> Iterator[MessageEntry]:
+        """Yield new entries as they appear (naïve long-poll loop).
+
+        This is a convenience iterator for scripts and notebooks. Production
+        code should use the async client and websockets where available.
         """
-        return did in self.members
+        import time
+
+        cursor = self._client.lane_tail(self._room, lane)
+        while True:
+            entries = self._client.read_lane(
+                self._room, lane, since=cursor, limit=100
+            )
+            for entry in entries:
+                yield entry
+                cursor = max(cursor, entry.sequence)
+            time.sleep(max(0.0, poll_interval))
+
+    def since(
+        self,
+        sequence: int,
+        *,
+        lane: LaneName = DEFAULT_LANE,
+        limit: int = 100,
+    ) -> List[MessageEntry]:
+        """Return entries with ``sequence > sequence`` on ``lane``."""
+        if sequence < 0:
+            raise ValueError("sequence must be non-negative")
+        return list(
+            self._client.read_lane(self._room, lane, since=sequence, limit=limit)
+        )
+
+    def between(
+        self,
+        start: int,
+        end: int,
+        *,
+        lane: LaneName = DEFAULT_LANE,
+    ) -> List[MessageEntry]:
+        """Return entries with ``start < sequence <= end`` on ``lane``."""
+        if end < start:
+            raise ValueError("end must be >= start")
+        return [
+            e for e in self.since(start, lane=lane, limit=end - start)
+            if e.sequence <= end
+        ]
+
+    # ---- discovery --------------------------------------------------------
+
+    def lanes(self) -> Iterable[Lane]:
+        """Yield the lane descriptors advertised by the server for this room."""
+        return self._client.list_lanes(self._room)
+
+    def exists(self) -> bool:
+        """Return ``True`` if the server reports the room as present."""
+        try:
+            self._client.head_room(self._room)
+            return True
+        except RoomNotFoundError:
+            return False
+        except TransportError:
+            return False
 
 
-__all__ = ["Room", "RoomMessage", "MAX_MESSAGE_BYTES", "ALLOWED_KINDS"]
+__all__ = ["RoomChannel", "PostResult", "LaneName"]
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
