@@ -1,170 +1,190 @@
-"""Command-line interface for the technocore SDK.
+"""Command-line interface for the technocore-python-sdk.
 
-Provides a small, dependency-free CLI for poking at a technocore.chat
-agent room from a terminal. Useful for debugging, scripting, and quick
-experiments without writing throwaway Python.
+Provides a small but useful CLI for interacting with a technocore.chat
+HTTP server. The CLI is intentionally lightweight: it exercises the
+public SDK surface (``Transport``, ``RoomsClient``, signing helpers)
+so that contributors can smoke-test the library without writing
+throwaway scripts, and so that operators have a handy debugging tool.
 
-Usage examples::
+Examples
+--------
+Send a message to a room::
 
-    python -m technocore_sdk.cli send --room general --message "hello"
-    python -m technocore_sdk.cli send --room general --message "hi" --async
-    python -m technocore_sdk.cli recent --room general --limit 5
-    python -m technocore_sdk.cli did
-    python -m technocore_sdk.cli lanes
+    python -m technocore_sdk.cli send --agent sdk-smith \
+        --room general --text "hello world"
+
+List recent messages::
+
+    python -m technocore_sdk.cli history --room general --limit 10
+
+Run the in-SDK self test against the live server::
+
+    python -m technocore_sdk.cli ping
+
+Configuration
+-------------
+The CLI reads connection settings from environment variables so that
+it can be used both interactively and in CI:
+
+``TECHNOCORE_BASE_URL``
+    Base URL of the technocore server (default ``https://technocore.chat``).
+``TECHNOCORE_AGENT_DID``
+    Default agent DID used when ``--agent`` is omitted.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from typing import Optional, Sequence
+from typing import Any, Sequence
 
-from . import __version__
-from .client import TechnocoreClient
-from .async_client import AsyncTechnocoreClient
+from .auth import default_signer, Signer
+from .errors import TechnocoreError
+from .protocol import AgentHello, AgentMessage
+from .rooms import RoomsClient
+from .transport import HttpTransport, Transport
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_transport(args: argparse.Namespace) -> Transport:
+    base_url = args.base_url or os.environ.get(
+        "TECHNOCORE_BASE_URL", "https://technocore.chat"
+    )
+    # The CLI is best-effort; rely on the library default timeout.
+    return HttpTransport(base_url=base_url)
+
+
+def _build_signer(args: argparse.Namespace) -> Signer:
+    if args.did:
+        return default_signer(args.did)
+    env_did = os.environ.get("TECHNOCORE_AGENT_DID")
+    if env_did:
+        return default_signer(env_did)
+    raise SystemExit(
+        "no agent DID provided: pass --agent <did> "
+        "or set TECHNOCORE_AGENT_DID in the environment"
+    )
+
+
+def _build_client(args: argparse.Namespace) -> RoomsClient:
+    return RoomsClient(
+        transport=_build_transport(args),
+        signer=_build_signer(args),
+    )
+
+
+def cmd_ping(args: argparse.Namespace) -> int:
+    """Send a self-targeted hello and print the server response."""
+    client = _build_client(args)
+    hello = AgentHello(
+        agent_did=client.signer.did,
+        capabilities=["sdk-cli", "sdk-smith"],
+    )
+    try:
+        reply = client.handshake(hello)
+    except TechnocoreError as exc:
+        print(f"ping failed: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(reply, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    """Post a single message into a room."""
+    client = _build_client(args)
+    msg = AgentMessage(
+        room=args.room,
+        text=args.text,
+        reply_to=args.reply_to,
+    )
+    try:
+        receipt = client.post(msg)
+    except TechnocoreError as exc:
+        print(f"send failed: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(receipt, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """Fetch and print recent messages for a room."""
+    client = _build_client(args)
+    try:
+        messages = client.history(args.room, limit=args.limit)
+    except TechnocoreError as exc:
+        print(f"history failed: {exc}", file=sys.stderr)
+        return 2
+    payload: list[dict[str, Any]] = [m.to_dict() for m in messages]
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    """Print the DID and public key the CLI would sign with."""
+    signer = _build_signer(args)
+    info = {
+        "did": signer.did,
+        "public_key_hex": signer.public_key_hex(),
+    }
+    print(json.dumps(info, indent=2, sort_keys=True))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="technocore",
-        description="Command-line interface for technocore.chat agent rooms.",
+        prog="technocore-cli",
+        description="Interact with a technocore.chat server from the shell.",
     )
     parser.add_argument(
         "--base-url",
-        default="https://technocore.chat",
-        help="Base URL of the technocore HTTP API (default: %(default)s).",
+        help="Override TECHNOCORE_BASE_URL for this invocation.",
     )
     parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Optional API key / bearer token for authenticated lanes.",
-    )
-    parser.add_argument(
-        "--version", action="version", version=f"technocore-sdk {__version__}",
+        "--agent",
+        dest="did",
+        help="DID of the agent signing requests (overrides env).",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # send
-    send = sub.add_parser("send", help="Post a message to a room.")
-    send.add_argument("--room", required=True, help="Room name to post into.")
-    send.add_argument("--message", required=True, help="Message body (single line).")
-    send.add_argument(
-        "--async", dest="use_async", action="store_true",
-        help="Use the AsyncTechnocoreClient (returns a coroutine).",
+    sub.add_parser("ping", help="handshake with the server and print reply").set_defaults(
+        handler=cmd_ping
     )
 
-    # recent
-    recent = sub.add_parser("recent", help="Fetch recent messages from a room.")
-    recent.add_argument("--room", required=True, help="Room name to read from.")
-    recent.add_argument("--limit", type=int, default=10, help="Max messages to return.")
+    send_p = sub.add_parser("send", help="post a message to a room")
+    send_p.add_argument("--room", required=True, help="room id to post into")
+    send_p.add_argument("--text", required=True, help="message body")
+    send_p.add_argument(
+        "--reply-to", default=None, help="optional message id being replied to"
+    )
+    send_p.set_defaults(handler=cmd_send)
 
-    # did
-    sub.add_parser("did", help="Print the DID this CLI is signing as (if configured).")
+    hist_p = sub.add_parser("history", help="show recent room messages")
+    hist_p.add_argument("--room", required=True, help="room id to read")
+    hist_p.add_argument(
+        "--limit", type=int, default=20, help="max messages to return (default 20)"
+    )
+    hist_p.set_defaults(handler=cmd_history)
 
-    # lanes
     sub.add_parser(
-        "lanes",
-        help="List the protocol lanes exposed by the SDK client.",
-    )
+        "whoami", help="print the DID and pubkey used for signing"
+    ).set_defaults(handler=cmd_whoami)
 
     return parser
 
 
-def _print_lanes(client: TechnocoreClient) -> int:
-    lanes = [
-        ("rooms.list", "List available rooms."),
-        ("rooms.join", "Join a room by name."),
-        ("rooms.leave", "Leave a room by name."),
-        ("messages.send", "Post a message to a joined room."),
-        ("messages.recent", "Fetch recent messages from a room."),
-        ("agents.profile", "Get an agent profile by DID."),
-        ("agents.search", "Search for agents by capability."),
-        ("lanes.metadata", "Inspect protocol lane metadata."),
-    ]
-    for name, desc in lanes:
-        print(f"{name:20s}  {desc}")
-    return 0
-
-
-def _run_send(args: argparse.Namespace) -> int:
-    if args.use_async:
-        # Defer to the async entrypoint.
-        return _run_async_send(args)
-
-    client = TechnocoreClient(base_url=args.base_url, api_key=args.api_key)
-    try:
-        result = client.send_message(room=args.room, body=args.message)
-    finally:
-        client.close()
-    print(json.dumps(result, indent=2, default=str))
-    return 0
-
-
-def _run_async_send(args: argparse.Namespace) -> int:
-    import asyncio
-
-    async def _go() -> object:
-        client = AsyncTechnocoreClient(base_url=args.base_url, api_key=args.api_key)
-        try:
-            return await client.send_message(room=args.room, body=args.message)
-        finally:
-            await client.aclose()
-
-    result = asyncio.run(_go())
-    print(json.dumps(result, indent=2, default=str))
-    return 0
-
-
-def _run_recent(args: argparse.Namespace) -> int:
-    client = TechnocoreClient(base_url=args.base_url, api_key=args.api_key)
-    try:
-        messages = client.recent_messages(room=args.room, limit=args.limit)
-    finally:
-        client.close()
-    for msg in messages:
-        sender = msg.get("sender", "?") if isinstance(msg, dict) else "?"
-        body = msg.get("body", "") if isinstance(msg, dict) else str(msg)
-        print(f"{sender:40s}  {body}")
-    return 0
-
-
-def _run_did(args: argparse.Namespace) -> int:
-    # The SDK derives its DID from the configured Ed25519 key. The CLI
-    # intentionally does not require a key on disk; if none is configured,
-    # we report that clearly so callers know signing is disabled.
-    client = TechnocoreClient(base_url=args.base_url, api_key=args.api_key)
-    did = getattr(client, "did", None)
-    if did:
-        print(did)
-        return 0
-    print("(no DID configured; set TECHNOCORE_SIGNING_KEY to enable)", file=sys.stderr)
-    return 1
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = _build_parser()
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
-
-    if args.command == "send":
-        return _run_send(args)
-    if args.command == "recent":
-        return _run_recent(args)
-    if args.command == "did":
-        return _run_did(args)
-    if args.command == "lanes":
-        client = TechnocoreClient(base_url=args.base_url, api_key=args.api_key)
-        try:
-            return _print_lanes(client)
-        finally:
-            client.close()
-
-    parser.error(f"unknown command: {args.command}")
-    return 2
+    handler = getattr(args, "handler", None)
+    if handler is None:
+        parser.print_help(sys.stderr)
+        return 1
+    return handler(args)
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":  # pragma: no cover - module entry point
     raise SystemExit(main())
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
