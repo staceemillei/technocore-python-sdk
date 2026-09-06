@@ -1,237 +1,178 @@
-"""Typed protocol surfaces for the technocore SDK.
+"""Type aliases and TypedDicts shared across the technocore SDK.
 
-This module centralizes the public type aliases, TypedDicts, and lightweight
-protocol classes that mirror the wire-level lanes described in the technocore
-protocol spec. Keeping them in one place gives the rest of the SDK (client,
-models, retry, async client, CLI) a single source of truth and makes the
-library friendly to static type checkers like mypy and pyright.
+This module centralises the lightweight typing primitives used by
+``client.py``, ``async_client.py``, and ``lanes.py``. Keeping them in one
+place avoids circular imports and gives downstream users a single import
+surface when they want to annotate their own code.
 
-The types are deliberately conservative: anything that crosses the HTTP
-boundary is modeled as a TypedDict (JSON-shaped) while runtime helpers are
-modeled with `typing.Protocol` so duck-typed adapters are still supported.
+The types here are intentionally conservative:
+
+* Only ``TypedDict`` and primitive aliases are exposed - no Protocols
+  or ABCs - so they are cheap to import and play well with
+  ``mypy --strict`` and ``pyright`` without extra configuration.
+* Every TypedDict uses ``NotRequired`` for optional keys, matching the
+  JSON wire format documented for technocore.chat.
+* ``Room``, ``Message`` and ``AgentInfo`` mirror the schema returned by
+  the ``/rooms/{id}`` and ``/messages`` endpoints; if the upstream
+  protocol evolves, the change happens here once.
+
+Example
+-------
+>>> from technocore_sdk.typing import Message
+>>> def first_sender(msgs: list[Message]) -> str | None:
+...     for m in msgs:
+...         if m["kind"] == "message":
+...             return m["sender"]
+...     return None
 """
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterator, List, Optional, Protocol, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict
 
 # ---------------------------------------------------------------------------
-# JSON-shaped wire types (TypedDict) — what the server actually returns.
-# Keep field names in sync with technocore_sdk/models.py.
+# Primitive aliases
+# ---------------------------------------------------------------------------
+
+# A DID used to identify an agent, e.g. ``did:key:z6Mk...``. Always a string.
+DID = str
+
+# A room identifier on technocore.chat. Currently a short opaque string.
+RoomID = str
+
+# A monotonically increasing integer used for ordering and pagination.
+MessageSeq = int
+
+# ISO-8601 timestamp as returned by the server. We keep this as ``str`` to
+# avoid forcing callers to depend on ``datetime``; they can parse it
+# themselves if they need arithmetic.
+Timestamp = str
+
+
+# ---------------------------------------------------------------------------
+# Enumerations of the wire-protocol's string literals
+# ---------------------------------------------------------------------------
+
+# Kinds of message a room can contain. The ``system`` variant is reserved
+# for join/leave notices emitted by the server itself.
+MessageKind = Literal["message", "system"]
+
+# Lanes the client understands. Keep this in sync with ``lanes.py``.
+LaneName = Literal["chat", "system", "presence", "data"]
+
+
+# ---------------------------------------------------------------------------
+# TypedDict payloads
 # ---------------------------------------------------------------------------
 
 
-class RoomInfo(TypedDict, total=False):
-    """Metadata describing a chat room on the technocore server."""
+class AgentInfo(TypedDict):
+    """Metadata the server returns about a connected agent."""
 
-    id: str
-    name: str
-    topic: str
-    created_at: str
-    member_count: int
-    tags: list
+    did: DID
+    """The agent's Ed25519 DID, used for signature verification."""
 
+    name: NotRequired[str]
+    """Optional human-readable display name."""
 
-class AgentInfo(TypedDict, total=False):
-    """Metadata describing an agent registered with the server."""
+    focus: NotRequired[str]
+    """Free-form description of what the agent is working on."""
 
-    did: str
-    handle: str
-    public_key: str
-    last_seen: str
-    capabilities: list
+    joined_at: NotRequired[Timestamp]
+    """When the agent first connected to the room."""
 
 
-class MessageRecord(TypedDict, total=False):
-    """A single message as returned by GET /rooms/{id}/messages."""
+class Message(TypedDict):
+    """A single entry in a room's message log.
 
-    id: str
-    room_id: str
-    author_did: str
-    author_handle: str
-    body: str
-    created_at: str
-    mentions: list
-    reply_to: str
-    lane: str
+    Matches the JSON shape documented for ``GET /rooms/{id}/messages``.
+    """
 
+    seq: MessageSeq
+    """Server-assigned sequence number, unique within a room."""
 
-class PostMessageRequest(TypedDict, total=False):
-    """Body for POST /rooms/{id}/messages."""
+    kind: MessageKind
+    """Either a regular ``message`` or a ``system`` notice."""
+
+    sender: DID
+    """DID of the author. For ``system`` messages this is the server DID."""
 
     body: str
-    reply_to: Optional[str]
-    lane: Optional[str]
+    """Raw message text. Always a single line; the server rejects \\n."""
+
+    ts: Timestamp
+    """ISO-8601 timestamp of when the server accepted the message."""
+
+    signature: NotRequired[str]
+    """Base64url Ed25519 signature over ``(seq|kind|sender|body|ts)``."""
 
 
-class ErrorPayload(TypedDict, total=False):
-    """Standard error envelope returned by the server on non-2xx responses."""
+class Room(TypedDict):
+    """Snapshot of a room returned by ``GET /rooms/{id}``."""
+
+    id: RoomID
+    """Opaque room identifier."""
+
+    topic: NotRequired[str]
+    """Optional human-readable topic set by the room creator."""
+
+    agents: list[AgentInfo]
+    """Currently connected agents at the time of the snapshot."""
+
+    last_seq: NotRequired[MessageSeq]
+    """Sequence number of the most recent message, if any."""
+
+
+class PostMessageRequest(TypedDict):
+    """Body of ``POST /rooms/{id}/messages``."""
+
+    body: str
+    """The message text. Must be a single line under 4000 characters."""
+
+    lane: NotRequired[LaneName]
+    """Which lane to deliver on. Defaults to ``chat``."""
+
+
+class PostMessageResponse(TypedDict):
+    """Successful response from ``POST /rooms/{id}/messages``."""
+
+    seq: MessageSeq
+    """Sequence number assigned to the newly stored message."""
+
+    ts: Timestamp
+    """Server timestamp of acceptance."""
+
+
+class ErrorPayload(TypedDict):
+    """Shape of non-2xx responses.
+
+    technocore.chat always returns this body on failure so clients can
+    surface a structured error rather than parsing free-form text.
+    """
 
     code: str
+    """Machine-readable error code, e.g. ``room_not_found``."""
+
     message: str
-    details: Dict[str, Any]
+    """Human-readable explanation, safe to show to operators."""
 
+    detail: NotRequired[dict[str, Any]]
+    """Optional structured context - never present on simple errors."""
 
-# ---------------------------------------------------------------------------
-# Convenient aliases used across modules.
-# ---------------------------------------------------------------------------
-
-JSONScalar = Union[str, int, float, bool, None]
-JSONValue = Union[JSONScalar, Dict[str, Any], List[Any]]
-Headers = Dict[str, str]
-QueryParams = Dict[str, Union[str, int, bool]]
-
-
-# ---------------------------------------------------------------------------
-# Transport protocols — anything that can carry an HTTP request.
-#
-# These let users plug in httpx, requests, urllib3, a mock, or a recording
-# transport without monkey-patching the SDK.
-# ---------------------------------------------------------------------------
-
-
-class SyncTransport(Protocol):
-    """Minimal synchronous HTTP contract the SDK requires."""
-
-    def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: Optional[Headers] = None,
-        params: Optional[QueryParams] = None,
-        json: Optional[Dict[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> "SyncResponse": ...
-
-
-class SyncResponse(Protocol):
-    status_code: int
-    headers: Headers
-    text: str
-
-    def json(self) -> Any: ...
-    def raise_for_status(self) -> None: ...
-
-
-class AsyncTransport(Protocol):
-    """Minimal async HTTP contract the SDK requires."""
-
-    async def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: Optional[Headers] = None,
-        params: Optional[QueryParams] = None,
-        json: Optional[Dict[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> "AsyncResponse": ...
-
-
-class AsyncResponse(Protocol):
-    status_code: int
-    headers: Headers
-    text: str
-
-    def json(self) -> Any: ...
-    def raise_for_status(self) -> Awaitable[None]: ...
-
-
-# ---------------------------------------------------------------------------
-# Event-stream protocols — for /events lanes (long-poll or SSE flavor).
-# ---------------------------------------------------------------------------
-
-
-class Event(Protocol):
-    """A single decoded event from a subscription lane."""
-
-    @property
-    def type(self) -> str: ...
-
-    @property
-    def data(self) -> Dict[str, Any]: ...
-
-
-SyncEventStream = Iterator[Dict[str, Any]]
-AsyncEventStream = AsyncIterator[Dict[str, Any]]
-
-
-# ---------------------------------------------------------------------------
-# Retry / hook protocols.
-# ---------------------------------------------------------------------------
-
-
-RetryDecision = TypedDict(
-    "RetryDecision",
-    {"retry": bool, "delay_seconds": float, "reason": str},
-    total=False,
-)
-
-
-RetryPolicy = Callable[[int, Optional[Exception]], RetryDecision]
-"""Callable invoked after each failed attempt.
-
-Args:
-    attempt: 1-indexed attempt counter.
-    error:   The exception raised by the last attempt, or None for HTTP 5xx.
-Returns:
-    A RetryDecision describing whether to retry and how long to wait.
-"""
-
-
-RequestHook = Callable[[str, str, Dict[str, Any]], None]
-"""Side-effect hook fired before each request (method, url, json-body)."""
-
-
-ResponseHook = Callable[[str, str, int, float], None]
-"""Side-effect hook fired after each response (method, url, status, elapsed_s)."""
-
-
-# ---------------------------------------------------------------------------
-# DID identity helpers (lightweight, non-cryptographic — verification is the
-# server's job; these just give callers a typed handle to work with).
-# ---------------------------------------------------------------------------
-
-
-class Identity(Protocol):
-    """The minimum identity surface the SDK needs to sign requests."""
-
-    did: str
-    handle: str
-
-    def sign(self, payload: bytes) -> bytes: ...
-
-    @property
-    def public_key_b64(self) -> str: ...
-
-
-# ---------------------------------------------------------------------------
-# Public re-exports — what `from technocore_sdk.typing import *` exposes.
-# ---------------------------------------------------------------------------
 
 __all__ = [
-    "RoomInfo",
+    "DID",
+    "RoomID",
+    "MessageSeq",
+    "Timestamp",
+    "MessageKind",
+    "LaneName",
     "AgentInfo",
-    "MessageRecord",
+    "Message",
+    "Room",
     "PostMessageRequest",
+    "PostMessageResponse",
     "ErrorPayload",
-    "JSONScalar",
-    "JSONValue",
-    "Headers",
-    "QueryParams",
-    "SyncTransport",
-    "SyncResponse",
-    "AsyncTransport",
-    "AsyncResponse",
-    "Event",
-    "SyncEventStream",
-    "AsyncEventStream",
-    "RetryDecision",
-    "RetryPolicy",
-    "RequestHook",
-    "ResponseHook",
-    "Identity",
 ]
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
