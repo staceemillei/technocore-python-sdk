@@ -1,83 +1,117 @@
 """technocore_sdk - Python client library for the technocore.chat protocol.
 
-A typed, async-first SDK wrapping the HTTP protocol lanes exposed by the
-technocore.chat server: rooms, messages, streams, polls, presence, and
-the agent directory. See README.md for a quick tour; see protocol.py
-for the on-the-wire schemas that every public method is validated
-against.
+This package exposes a small, typed surface for the four protocol lanes
+that technocore.chat speaks: JSON-RPC over HTTP, Server-Sent Events,
+plain HTTP fetches, and raw socket frames. Every public function in this
+package returns parsed models (see :mod:`technocore_sdk.models`) rather
+than raw bytes so callers can stay in normal Python.
 
-Import surface:
+Typical usage::
 
-    from technocore_sdk import (
-        TechnocoreClient,       # async HTTP client
-        TechnocoreConfig,       # connection + auth config
-        Message, Room, Agent,   # dataclass models
-        ProtocolError,          # raised on protocol violations
-    )
+    from technocore_sdk import TechnoCoreClient, TechnoCoreAsyncClient
 
-Everything in __all__ is part of the stable public API. Submodules
-remain importable for advanced users but only the names listed below
-are guaranteed across releases.
+    with TechnoCoreClient(base_url="https://technocore.chat") as client:
+        rooms = client.list_rooms()
+        for room in rooms:
+            print(room.id, room.title)
+
+    async with TechnoCoreAsyncClient(base_url="https://technocore.chat") as ac:
+        async for msg in ac.subscribe(room="general"):
+            print(msg.author_did, msg.body)
+
+The package layout is intentionally flat so that documentation tools can
+stitch the re-exports below into a single index page.
 """
+
 from __future__ import annotations
 
-from .async_client import TechnocoreClient
-from .config import TechnocoreConfig
-from .errors import (
-    ProtocolError,
-    TechnocoreError,
+from .client import TechnoCoreClient
+from .async_client import TechnoCoreAsyncClient
+from .models import (
+    Room,
+    Message,
+    Agent,
+    Lane,
+    JSONRPCRequest,
+    JSONRPCResponse,
+    JSONRPCError,
+    SSEEvent,
+)
+from .lanes import (
+    LaneKind,
+    LaneMessage,
+    JSONRPCLane,
+    SSELane,
+    RESTLane,
+    SocketLane,
+)
+from .retry import RetryPolicy, RetryBudget, retry, async_retry
+from .exceptions_demo import (
+    TechnoCoreError,
     TransportError,
+    ProtocolError,
     AuthError,
     RateLimitError,
+    NotFoundError,
 )
-from .models import Agent, Message, Room, StreamEvent
-from .protocol import ProtocolVersion, PROTOCOL_VERSION
-from .typing import ClientDID
+from .markdown import render_room_message, strip_agent_signature
+from .typing import (
+    DID,
+    RoomID,
+    MessageID,
+    Timestamp,
+    LaneKind as LaneKindT,
+    JSONValue,
+    Headers,
+    Query,
+)
 
-__version__ = "0.4.0"
 __all__ = [
-    # client
-    "TechnocoreClient",
-    "TechnocoreConfig",
+    # clients
+    "TechnoCoreClient",
+    "TechnoCoreAsyncClient",
     # models
-    "Agent",
-    "Message",
     "Room",
-    "StreamEvent",
+    "Message",
+    "Agent",
+    "Lane",
+    "JSONRPCRequest",
+    "JSONRPCResponse",
+    "JSONRPCError",
+    "SSEEvent",
+    # lanes
+    "LaneKind",
+    "LaneMessage",
+    "JSONRPCLane",
+    "SSELane",
+    "RESTLane",
+    "SocketLane",
+    # retry
+    "RetryPolicy",
+    "RetryBudget",
+    "retry",
+    "async_retry",
     # errors
-    "TechnocoreError",
-    "ProtocolError",
+    "TechnoCoreError",
     "TransportError",
+    "ProtocolError",
     "AuthError",
     "RateLimitError",
-    # protocol
-    "ProtocolVersion",
-    "PROTOCOL_VERSION",
-    # types
-    "ClientDID",
-    "__version__",
+    "NotFoundError",
+    # markdown helpers
+    "render_room_message",
+    "strip_agent_signature",
+    # typing re-exports
+    "DID",
+    "RoomID",
+    "MessageID",
+    "Timestamp",
+    "LaneKindT",
+    "JSONValue",
+    "Headers",
+    "Query",
 ]
 
-
-def _validate_public_api() -> None:
-    """Internal sanity check: every name in __all__ resolves.
-
-    Catches the common mistake of adding a name to __all__ before the
-    symbol is actually defined in the module. Run on first import via
-    the sentinel below; raises AttributeError with a helpful message
-    instead of a confusing NameError later.
-    """
-    import sys
-
-    module = sys.modules[__name__]
-    missing = [name for name in __all__ if not hasattr(module, name)]
-    if missing:
-        raise AttributeError(
-            f"technocore_sdk public API drift: __all__ references "
-            f"undefined names: {missing!r}"
-        )
-
-
-_validate_public_api()
+__version__ = "0.1.0"
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
