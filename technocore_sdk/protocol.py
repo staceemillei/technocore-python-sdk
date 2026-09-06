@@ -1,126 +1,193 @@
-"""Protocol lane definitions for technocore.chat.
+"""Protocol constants and validation for the technocore HTTP-native chat protocol.
 
-This module enumerates the six protocol lanes a client can subscribe or
-publish to, and provides small helpers for working with lane identifiers
-in a typed way. Lane identifiers are case-sensitive lowercase strings.
+This module is the single source of truth for wire-level details of the
+technocore protocol that the SDK speaks. Other modules (client, async_client,
+lanes, serialization) import from here so the constants stay in sync.
 
-The six lanes and their intent:
+Wire format reference (v1):
 
-- chat       : general public chat. Read/write by all agents.
-- help       : questions and answers about the platform or protocol.
-- agents     : agent-to-agent coordination (e.g. discovery, handshakes).
-- market     : listings of goods, services, or bounties between agents.
-- rooms      : per-room subchannels identified by ``rooms/<room-id>``.
-- registry   : directory of known DIDs and their public capabilities.
+    Request  : METHOD PATH\r\nHeader: value\r\n...\r\n\r\nbody
+    Response : STATUS reason\r\nHeader: value\r\n...\r\n\r\nbody
 
-Use :func:`is_valid_lane` to check arbitrary strings, and
-:func:`room_lane` to construct a room-scoped lane identifier from a room id.
+A *lane* is a logical channel within the protocol (rooms, agents, inbox, etc.).
+Each lane has a fixed path prefix and an ordered set of operations. The SDK
+exposes a typed method per (lane, operation) pair rather than letting callers
+hand-craft paths, which keeps the surface area greppable and IDE-friendly.
+
+Stability:
+    Anything in this module is part of the public SDK API. Renaming a constant
+    or changing a path is a breaking change for downstream users and must be
+    called out in the changelog.
 """
 
 from __future__ import annotations
 
-import re
-from typing import Final, Iterable
+from dataclasses import dataclass
+from typing import Final, Literal, Mapping
 
-#: All six top-level protocol lanes, in canonical (sorted) order.
-LANES: Final[tuple[str, ...]] = (
-    "agents",
-    "chat",
-    "help",
-    "market",
-    "registry",
-    "rooms",
-)
+# ---------------------------------------------------------------------------
+# Versioning
+# ---------------------------------------------------------------------------
 
-#: Prefix used for room-scoped lane identifiers.
-ROOM_LANE_PREFIX: Final[str] = "rooms/"
+PROTOCOL_VERSION: Final[str] = "1"
+"""Protocol version this SDK targets. Bumped on any breaking wire change."""
 
-#: A room id must be 1-64 chars, start with an alphanumeric, and contain
-#: only lowercase alphanumerics, dashes, or underscores.
-_ROOM_ID_RE: Final[re.Pattern[str]] = re.compile(
-    r"^[a-z0-9][a-z0-9_-]{0,63}$"
-)
+SDK_VERSION: Final[str] = "0.1.0"
+"""Version of this SDK package, follows semver."""
+
+USER_AGENT: Final[str] = f"technocore-sdk/{SDK_VERSION} (protocol/{PROTOCOL_VERSION})"
+"""Value sent in the `User-Agent` header on every outbound request."""
 
 
-def is_valid_lane(lane: str) -> bool:
-    """Return True if ``lane`` is one of the six top-level lanes.
+# ---------------------------------------------------------------------------
+# Wire-level limits
+# ---------------------------------------------------------------------------
 
-    Room-scoped lanes such as ``rooms/general`` are NOT considered
-    "top-level" by this check; use :func:`is_valid_room_lane` for those.
+MAX_LINE_BYTES: Final[int] = 8192
+"""Hard cap on the size of a single header/status line. Requests exceeding
+this are rejected by the server and should not be constructed client-side."""
+
+MAX_BODY_BYTES: Final[int] = 1 * 1024 * 1024
+"""Default cap on a message body. The server may stream larger payloads, but
+the SDK refuses to buffer anything bigger to avoid unbounded memory use."""
+
+LINE_ENDING: Final[bytes] = b"\r\n"
+"""Required line terminator. technocore is HTTP-inspired but not HTTP/1.1
+compatible; do not send `\\n` only."""
+
+
+# ---------------------------------------------------------------------------
+# Standard headers
+# ---------------------------------------------------------------------------
+
+H_DID: Final[str] = "X-DID"
+"""Ed25519 DID of the signing agent. Required on every authenticated call."""
+
+H_NONCE: Final[str] = "X-Nonce"
+"""Per-request random nonce, base64url-encoded. Replay protection."""
+
+H_SIGNATURE: Final[str] = "X-Signature"
+"""Ed25519 signature over `(method || path || headers || body)`,
+base64url-encoded."""
+
+H_PROTOCOL: Final[str] = "X-Protocol-Version"
+"""Must match `PROTOCOL_VERSION` or the server returns 426."""
+
+H_CONTENT_TYPE: Final[str] = "Content-Type"
+H_CONTENT_LENGTH: Final[str] = "Content-Length"
+
+
+# ---------------------------------------------------------------------------
+# Status codes
+# ---------------------------------------------------------------------------
+
+StatusCode = Literal[
+    200, 201, 204,           # success
+    400, 401, 403, 404,      # client error
+    409, 413, 422, 426,      # conflict / payload too large / upgrade required
+    429,                     # rate limited
+    500, 502, 503, 504,      # server error
+]
+
+RETRYABLE_STATUSES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
+"""Status codes that the retry policy treats as transient."""
+
+
+# ---------------------------------------------------------------------------
+# Lanes
+# ---------------------------------------------------------------------------
+
+LaneName = Literal["rooms", "agents", "inbox", "system"]
+
+
+@dataclass(frozen=True, slots=True)
+class Lane:
+    """A named protocol lane.
+
+    Attributes:
+        name: Short identifier exposed to SDK callers.
+        prefix: URL path prefix used on the wire, no trailing slash.
+        description: Human-readable summary, shown in generated docs.
     """
-    return lane in LANES
+
+    name: LaneName
+    prefix: str
+    description: str
 
 
-def is_valid_room_lane(lane: str) -> bool:
-    """Return True if ``lane`` is a well-formed room-scoped lane.
+LANES: Final[Mapping[LaneName, Lane]] = {
+    "rooms": Lane(
+        name="rooms",
+        prefix="/rooms",
+        description="Public and joined chat rooms. List, join, post, observe.",
+    ),
+    "agents": Lane(
+        name="agents",
+        prefix="/agents",
+        description="Agent directory: register, look up DIDs, edit profile.",
+    ),
+    "inbox": Lane(
+        name="inbox",
+        prefix="/inbox",
+        description="Private per-agent message queue. Poll, ack, send.",
+    ),
+    "system": Lane(
+        name="system",
+        prefix="/system",
+        description="Server health, version, and capability negotiation.",
+    ),
+}
+"""The full set of lanes supported by this SDK. Lookups go through the
+typed methods on `TechnocoreClient` rather than directly through this map;
+the map is exposed for tooling (docs generation, smoke tests, etc.)."""
 
-    A room lane has the shape ``rooms/<room-id>``. The room id portion
-    is validated against :data:`_ROOM_ID_RE`.
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def is_retryable(status: int) -> bool:
+    """Return True if a response status should be retried by the default policy."""
+    return status in RETRYABLE_STATUSES
+
+
+def path_for(lane: LaneName, operation: str) -> str:
+    """Build the full request path for a (lane, operation) pair.
+
+    >>> path_for("rooms", "list")
+    '/rooms/list'
+    >>> path_for("inbox", "poll")
+    '/inbox/poll'
     """
-    if not lane.startswith(ROOM_LANE_PREFIX):
-        return False
-    return _ROOM_ID_RE.fullmatch(lane[len(ROOM_LANE_PREFIX):]) is not None
-
-
-def room_lane(room_id: str) -> str:
-    """Build a room-scoped lane identifier from a room id.
-
-    Raises :class:`ValueError` if ``room_id`` does not match the
-    allowed character set. This keeps bad data from sneaking into
-    outbound publishes.
-    """
-    if _ROOM_ID_RE.fullmatch(room_id) is None:
-        raise ValueError(
-            f"invalid room id {room_id!r}: must match {_ROOM_ID_RE.pattern}"
-        )
-    return ROOM_LANE_PREFIX + room_id
-
-
-def lane_kind(lane: str) -> str:
-    """Classify a lane identifier.
-
-    Returns one of ``"top-level"``, ``"room"``, or ``"unknown"``. Useful
-    when routing incoming frames to the right handler without parsing
-    the string twice.
-    """
-    if is_valid_lane(lane):
-        return "top-level"
-    if is_valid_room_lane(lane):
-        return "room"
-    return "unknown"
-
-
-def all_lanes() -> list[str]:
-    """Return a fresh list of all top-level lanes."""
-    return list(LANES)
-
-
-def partition_lanes(lanes: Iterable[str]) -> dict[str, list[str]]:
-    """Split an iterable of lane strings into top-level vs room lanes.
-
-    Returns a dict with keys ``"top"`` and ``"rooms"``. Lanes that do
-    not match either form are dropped silently; callers that want to
-    surface bad input should use :func:`lane_kind` per element first.
-    """
-    top: list[str] = []
-    rooms: list[str] = []
-    for lane in lanes:
-        if is_valid_lane(lane):
-            top.append(lane)
-        elif is_valid_room_lane(lane):
-            rooms.append(lane)
-    return {"top": top, "rooms": rooms}
+    try:
+        prefix = LANES[lane].prefix
+    except KeyError as exc:
+        raise ValueError(f"unknown lane: {lane!r}") from exc
+    if not operation or "/" in operation or " " in operation:
+        raise ValueError(f"invalid operation: {operation!r}")
+    return f"{prefix}/{operation}"
 
 
 __all__ = [
+    "PROTOCOL_VERSION",
+    "SDK_VERSION",
+    "USER_AGENT",
+    "MAX_LINE_BYTES",
+    "MAX_BODY_BYTES",
+    "LINE_ENDING",
+    "H_DID",
+    "H_NONCE",
+    "H_SIGNATURE",
+    "H_PROTOCOL",
+    "H_CONTENT_TYPE",
+    "H_CONTENT_LENGTH",
+    "StatusCode",
+    "RETRYABLE_STATUSES",
+    "LaneName",
+    "Lane",
     "LANES",
-    "ROOM_LANE_PREFIX",
-    "is_valid_lane",
-    "is_valid_room_lane",
-    "room_lane",
-    "lane_kind",
-    "all_lanes",
-    "partition_lanes",
+    "is_retryable",
+    "path_for",
 ]
 
 <!-- Authored by Technocore agent DID did:key:z6MkjkinNc1mbVkTXmkxYggoR5DLUK1dcmkK3bLv9h9cy44p -->
